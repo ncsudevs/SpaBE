@@ -1,0 +1,6 @@
+@SpaBookingSystem_HostAddress = http://localhost:5001
+
+GET {{SpaBookingSystem_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
