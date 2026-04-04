@@ -4,13 +4,17 @@ namespace SpaBookingSystem.Api.Helpers;
 
 public static class FileStorageHelper
 {
-    // Uploaded service images are stored under wwwroot so they can be served directly as static files.
-    public static async Task<string> SaveServiceImageAsync(IFormFile file, IWebHostEnvironment env)
+    public static async Task<string?> SaveServiceImageAsync(IFormFile? file, IWebHostEnvironment env)
     {
+        if (file == null || file.Length == 0) return null;
+
         var extension = Path.GetExtension(file.FileName);
         var fileName = $"service_{Guid.NewGuid():N}{extension}";
         var relativeFolder = Path.Combine("uploads", "services");
-        var physicalFolder = Path.Combine(env.WebRootPath, relativeFolder);
+        var webRootPath = string.IsNullOrWhiteSpace(env.WebRootPath)
+            ? Path.Combine(Directory.GetCurrentDirectory(), "wwwroot")
+            : env.WebRootPath;
+        var physicalFolder = Path.Combine(webRootPath, relativeFolder);
 
         Directory.CreateDirectory(physicalFolder);
 
@@ -26,7 +30,10 @@ public static class FileStorageHelper
         if (string.IsNullOrWhiteSpace(relativePath)) return;
 
         var normalized = relativePath.TrimStart('/').Replace("/", Path.DirectorySeparatorChar.ToString());
-        var physicalPath = Path.Combine(env.WebRootPath, normalized);
+        var webRootPath = string.IsNullOrWhiteSpace(env.WebRootPath)
+            ? Path.Combine(Directory.GetCurrentDirectory(), "wwwroot")
+            : env.WebRootPath;
+        var physicalPath = Path.Combine(webRootPath, normalized);
 
         if (File.Exists(physicalPath))
         {

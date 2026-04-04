@@ -12,18 +12,20 @@ public class Service
     [MaxLength(DataLengths.DESCRIPTION)]
     public string? Description { get; set; }
 
-    // Price is stored as decimal to preserve currency precision.
     public decimal Price { get; set; }
-
-    // Duration is stored in minutes for simpler display and summary calculation.
     public int Duration { get; set; }
 
     [MaxLength(DataLengths.STATUS)]
     public string Status { get; set; } = "ACTIVE";
 
-    // ImageUrl stores the relative public path returned after saving the uploaded file into wwwroot.
     [MaxLength(DataLengths.IMAGE_URL)]
     public string? ImageUrl { get; set; }
+
+    // Every service time slot uses the same default capacity, e.g. 09:00=5, 10:30=5.
+    public int SlotCapacity { get; set; } = 5;
+
+    public DateTime CreatedAt { get; set; }
+    public DateTime? UpdatedAt { get; set; }
 
     public int CategoryId { get; set; }
     public ServiceCategory? Category { get; set; }

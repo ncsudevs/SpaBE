@@ -116,6 +116,14 @@ namespace SpaBookingSystem.DataLayer.Migrations
                         .HasColumnType("nvarchar(150)")
                         .HasColumnName("full_name");
 
+                    b.Property<int>("GroupSize")
+                        .HasColumnType("int")
+                        .HasColumnName("group_size");
+
+                    b.Property<bool>("IsGroupBooking")
+                        .HasColumnType("bit")
+                        .HasColumnName("is_group_booking");
+
                     b.Property<string>("Note")
                         .HasMaxLength(4000)
                         .HasColumnType("nvarchar(4000)")
@@ -160,6 +168,16 @@ namespace SpaBookingSystem.DataLayer.Migrations
                         .HasColumnName("booking_detail_id");
 
                     SqlServerPropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<DateOnly>("AppointmentDate")
+                        .HasColumnType("date")
+                        .HasColumnName("appointment_date");
+
+                    b.Property<string>("AppointmentTime")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("nvarchar(20)")
+                        .HasColumnName("appointment_time");
 
                     b.Property<int>("BookingId")
                         .HasColumnType("int")
@@ -312,6 +330,10 @@ namespace SpaBookingSystem.DataLayer.Migrations
                         .HasColumnType("int")
                         .HasColumnName("category_id");
 
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("datetime2")
+                        .HasColumnName("created_at");
+
                     b.Property<string>("Description")
                         .HasMaxLength(4000)
                         .HasColumnType("nvarchar(4000)")
@@ -336,11 +358,19 @@ namespace SpaBookingSystem.DataLayer.Migrations
                         .HasColumnType("decimal(10,2)")
                         .HasColumnName("price");
 
+                    b.Property<int>("SlotCapacity")
+                        .HasColumnType("int")
+                        .HasColumnName("slot_capacity");
+
                     b.Property<string>("Status")
                         .IsRequired()
                         .HasMaxLength(30)
                         .HasColumnType("nvarchar(30)")
                         .HasColumnName("status");
+
+                    b.Property<DateTime?>("UpdatedAt")
+                        .HasColumnType("datetime2")
+                        .HasColumnName("updated_at");
 
                     b.HasKey("Id");
 

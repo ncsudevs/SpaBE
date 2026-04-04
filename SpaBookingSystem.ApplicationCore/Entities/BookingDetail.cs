@@ -6,8 +6,9 @@ public class BookingDetail
     public int BookingId { get; set; }
     public int ServiceId { get; set; }
     public int Quantity { get; set; }
+    public DateOnly AppointmentDate { get; set; }
+    public string? AppointmentTime { get; set; } = string.Empty;
 
-    // UnitPrice and LineTotal are persisted so booking history remains stable even if service prices change later.
     public decimal UnitPrice { get; set; }
     public decimal LineTotal { get; set; }
 

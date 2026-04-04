@@ -1,4 +1,4 @@
-﻿using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations;
 
 namespace SpaBookingSystem.Api.Dtos.Bookings;
 
@@ -9,4 +9,10 @@ public class BookingItemCreateDto
 
     [Range(1, 100)]
     public int Quantity { get; set; }
+
+    [Required]
+    public DateOnly AppointmentDate { get; set; }
+
+    [Required]
+    public string AppointmentTime { get; set; } = string.Empty;
 }

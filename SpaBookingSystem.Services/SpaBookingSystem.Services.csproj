@@ -11,4 +11,9 @@
     <ProjectReference Include="..\SpaBookingSystem.DataLayer\SpaBookingSystem.DataLayer.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <PackageReference Include="BCrypt.Net-Next" Version="4.0.3" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" Version="8.0.0" />
+  </ItemGroup>
+
 </Project>

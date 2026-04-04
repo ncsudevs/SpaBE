@@ -1,51 +1,57 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using SpaBookingSystem.Api.Dtos.Services;
 using SpaBookingSystem.Api.Helpers;
+using SpaBookingSystem.ApplicationCore.Entities;
 using SpaBookingSystem.DataLayer;
+using System.Security.Claims;
 
 namespace SpaBookingSystem.Api.Controllers;
 
 [ApiController]
 [Route("api/services")]
-public class ServicesController : ControllerBase
+public class ServiceController : ControllerBase
 {
     private readonly SpaDbContext _db;
-    private readonly IWebHostEnvironment _env;
+    private readonly IWebHostEnvironment _environment;
 
-    public ServicesController(SpaDbContext db, IWebHostEnvironment env)
+    public ServiceController(SpaDbContext db, IWebHostEnvironment environment)
     {
         _db = db;
-        _env = env;
+        _environment = environment;
     }
 
     [HttpGet]
     public async Task<ActionResult<List<ServiceDto>>> GetAll([FromQuery] int? categoryId)
     {
+        var role = User.FindFirstValue(ClaimTypes.Role) ?? string.Empty;
+
         var query = _db.Services
             .AsNoTracking()
-            .Include(s => s.Category)
+            .Include(x => x.Category)
             .AsQueryable();
 
-        // Category filtering is optional so the same endpoint supports both all-services and category pages.
+        if (role != "ADMIN")
+            query = query.Where(x => x.Status == "ACTIVE");
+
         if (categoryId.HasValue)
-        {
-            query = query.Where(s => s.CategoryId == categoryId.Value);
-        }
+            query = query.Where(x => x.CategoryId == categoryId.Value);
 
         var data = await query
-            .OrderByDescending(s => s.Id)
-            .Select(s => new ServiceDto
+            .OrderBy(x => x.Name)
+            .Select(x => new ServiceDto
             {
-                Id = s.Id,
-                Name = s.Name,
-                Description = s.Description,
-                Price = s.Price,
-                Duration = s.Duration,
-                Status = s.Status,
-                CategoryId = s.CategoryId,
-                CategoryName = s.Category != null ? s.Category.Name : null,
-                ImageUrl = s.ImageUrl
+                Id = x.Id,
+                Name = x.Name,
+                Description = x.Description,
+                Price = x.Price,
+                Duration = x.Duration,
+                Status = x.Status,
+                SlotCapacity = x.SlotCapacity,
+                CategoryId = x.CategoryId,
+                CategoryName = x.Category != null ? x.Category.Name : null,
+                ImageUrl = x.ImageUrl
             })
             .ToListAsync();
 
@@ -55,59 +61,17 @@ public class ServicesController : ControllerBase
     [HttpGet("{id:int}")]
     public async Task<ActionResult<ServiceDto>> GetById(int id)
     {
-        var s = await _db.Services
+        var entity = await _db.Services
             .AsNoTracking()
             .Include(x => x.Category)
             .FirstOrDefaultAsync(x => x.Id == id);
 
-        if (s == null) return NotFound();
+        if (entity == null) return NotFound(new { message = "Service not found" });
+
+        if (entity.Status != "ACTIVE" && (User.FindFirstValue(ClaimTypes.Role) ?? string.Empty) != "ADMIN")
+            return NotFound(new { message = "Service not found" });
 
         return Ok(new ServiceDto
-        {
-            Id = s.Id,
-            Name = s.Name,
-            Description = s.Description,
-            Price = s.Price,
-            Duration = s.Duration,
-            Status = s.Status,
-            CategoryId = s.CategoryId,
-            CategoryName = s.Category?.Name,
-            ImageUrl = s.ImageUrl
-        });
-    }
-
-    [HttpPost]
-    public async Task<ActionResult<ServiceDto>> Create([FromForm] ServiceCreateDto dto)
-    {
-        var catExists = await _db.ServiceCategories.AnyAsync(c => c.Id == dto.CategoryId);
-        if (!catExists) return BadRequest($"CategoryId {dto.CategoryId} not found");
-
-        string? imageUrl = null;
-        if (dto.ImageFile != null)
-        {
-            imageUrl = await FileStorageHelper.SaveServiceImageAsync(dto.ImageFile, _env);
-        }
-
-        var entity = new SpaBookingSystem.ApplicationCore.Entities.Service
-        {
-            Name = dto.Name.Trim(),
-            Description = string.IsNullOrWhiteSpace(dto.Description) ? null : dto.Description.Trim(),
-            Price = dto.Price,
-            Duration = dto.Duration,
-            Status = string.IsNullOrWhiteSpace(dto.Status) ? "ACTIVE" : dto.Status.Trim(),
-            CategoryId = dto.CategoryId,
-            ImageUrl = imageUrl
-        };
-
-        _db.Services.Add(entity);
-        await _db.SaveChangesAsync();
-
-        var catName = await _db.ServiceCategories
-            .Where(c => c.Id == entity.CategoryId)
-            .Select(c => c.Name)
-            .FirstOrDefaultAsync();
-
-        var result = new ServiceDto
         {
             Id = entity.Id,
             Name = entity.Name,
@@ -115,48 +79,88 @@ public class ServicesController : ControllerBase
             Price = entity.Price,
             Duration = entity.Duration,
             Status = entity.Status,
+            SlotCapacity = entity.SlotCapacity,
             CategoryId = entity.CategoryId,
-            CategoryName = catName,
+            CategoryName = entity.Category?.Name,
             ImageUrl = entity.ImageUrl
-        };
-
-        return CreatedAtAction(nameof(GetById), new { id = entity.Id }, result);
+        });
     }
 
+    [Authorize(Roles = "ADMIN")]
+    [HttpPost]
+    public async Task<ActionResult<ServiceDto>> Create([FromForm] ServiceCreateDto dto)
+    {
+        var categoryExists = await _db.ServiceCategories.AnyAsync(x => x.Id == dto.CategoryId);
+       
+
+        var imageUrl = await FileStorageHelper.SaveServiceImageAsync(dto.ImageFile, _environment);
+
+        var entity = new Service
+        {
+            Name = dto.Name.Trim(),
+            Description = dto.Description?.Trim(),
+            Price = dto.Price,
+            Duration = dto.Duration,
+            Status = string.IsNullOrWhiteSpace(dto.Status) ? "ACTIVE" : dto.Status.Trim().ToUpperInvariant(),
+            SlotCapacity = dto.SlotCapacity <= 0 ? 5 : dto.SlotCapacity,
+            CategoryId = dto.CategoryId,
+            ImageUrl = imageUrl,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow,
+        };
+
+        _db.Services.Add(entity);
+        await _db.SaveChangesAsync();
+
+        return CreatedAtAction(nameof(GetById), new { id = entity.Id }, new ServiceDto
+        {
+            Id = entity.Id,
+            Name = entity.Name,
+            Description = entity.Description,
+            Price = entity.Price,
+            Duration = entity.Duration,
+            Status = entity.Status,
+            SlotCapacity = entity.SlotCapacity,
+            CategoryId = entity.CategoryId,
+            CategoryName = null,
+            ImageUrl = entity.ImageUrl
+        });
+    }
+
+    [Authorize(Roles = "ADMIN")]
     [HttpPut("{id:int}")]
     public async Task<IActionResult> Update(int id, [FromForm] ServiceUpdateDto dto)
     {
         var entity = await _db.Services.FirstOrDefaultAsync(x => x.Id == id);
-        if (entity == null) return NotFound();
+        if (entity == null) return NotFound(new { message = "Service not found" });
 
-        var catExists = await _db.ServiceCategories.AnyAsync(c => c.Id == dto.CategoryId);
-        if (!catExists) return BadRequest($"CategoryId {dto.CategoryId} not found");
+        var categoryExists = await _db.ServiceCategories.AnyAsync(x => x.Id == dto.CategoryId);
+        if (!categoryExists) return BadRequest(new { message = "Category does not exist" });
+
+        var imageUrl = await FileStorageHelper.SaveServiceImageAsync(dto.ImageFile, _environment);
+        if (!string.IsNullOrWhiteSpace(imageUrl))
+            entity.ImageUrl = imageUrl;
 
         entity.Name = dto.Name.Trim();
-        entity.Description = string.IsNullOrWhiteSpace(dto.Description) ? null : dto.Description.Trim();
+        entity.Description = dto.Description?.Trim();
         entity.Price = dto.Price;
         entity.Duration = dto.Duration;
-        entity.Status = string.IsNullOrWhiteSpace(dto.Status) ? "ACTIVE" : dto.Status.Trim();
+        entity.SlotCapacity = dto.SlotCapacity <= 0 ? entity.SlotCapacity : dto.SlotCapacity;
+        entity.Status = string.IsNullOrWhiteSpace(dto.Status) ? entity.Status : dto.Status.Trim().ToUpperInvariant();
         entity.CategoryId = dto.CategoryId;
-
-        // Replacing the image removes the previous physical file first to avoid orphaned uploads.
-        if (dto.ImageFile != null)
-        {
-            FileStorageHelper.DeleteFileIfExists(entity.ImageUrl, _env);
-            entity.ImageUrl = await FileStorageHelper.SaveServiceImageAsync(dto.ImageFile, _env);
-        }
+        entity.UpdatedAt = DateTime.UtcNow;
 
         await _db.SaveChangesAsync();
         return NoContent();
     }
 
+    [Authorize(Roles = "ADMIN")]
     [HttpDelete("{id:int}")]
     public async Task<IActionResult> Delete(int id)
     {
         var entity = await _db.Services.FirstOrDefaultAsync(x => x.Id == id);
-        if (entity == null) return NotFound();
+        if (entity == null) return NotFound(new { message = "Service not found" });
 
-        FileStorageHelper.DeleteFileIfExists(entity.ImageUrl, _env);
         _db.Services.Remove(entity);
         await _db.SaveChangesAsync();
         return NoContent();

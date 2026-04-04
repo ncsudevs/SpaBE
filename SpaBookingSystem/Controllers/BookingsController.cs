@@ -1,8 +1,11 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using SpaBookingSystem.Api.Dtos.Bookings;
 using SpaBookingSystem.ApplicationCore.Entities;
 using SpaBookingSystem.DataLayer;
+using System.Security.Claims;
+using SpaBookingSystem.Api.Helpers;
 
 namespace SpaBookingSystem.Api.Controllers;
 
@@ -10,6 +13,8 @@ namespace SpaBookingSystem.Api.Controllers;
 [Route("api/bookings")]
 public class BookingsController : ControllerBase
 {
+    private static readonly string[] AdminAllowedStatuses = ["PENDING", "CONFIRMED", "COMPLETED", "CANCELLED"];
+
     private readonly SpaDbContext _db;
 
     public BookingsController(SpaDbContext db)
@@ -17,96 +22,143 @@ public class BookingsController : ControllerBase
         _db = db;
     }
 
+    [Authorize]
     [HttpGet]
     public async Task<ActionResult<List<BookingDto>>> GetAll([FromQuery] string? email)
     {
+        var role = User.FindFirstValue(ClaimTypes.Role) ?? string.Empty;
+        var currentEmail = User.FindFirstValue(ClaimTypes.Email)?.Trim().ToLowerInvariant();
+
         var query = _db.Bookings
             .AsNoTracking()
             .Include(x => x.BookingDetails)
                 .ThenInclude(x => x.Service)
             .AsQueryable();
 
-        // Customer pages use the email filter to read only the current user's booking history.
-        if (!string.IsNullOrWhiteSpace(email))
+        if (role == "ADMIN")
         {
-            var normalizedEmail = email.Trim().ToLower();
-            query = query.Where(x => x.Email.ToLower() == normalizedEmail);
+            if (!string.IsNullOrWhiteSpace(email))
+            {
+                var normalizedEmail = email.Trim().ToLowerInvariant();
+                query = query.Where(x => x.Email.ToLower() == normalizedEmail);
+            }
+        }
+        else
+        {
+            if (string.IsNullOrWhiteSpace(currentEmail))
+                return Unauthorized(new { message = "Invalid token" });
+
+            query = query.Where(x => x.Email.ToLower() == currentEmail);
         }
 
-        var data = await query
-            .OrderByDescending(x => x.CreatedAt)
-            .Select(x => new BookingDto
-            {
-                Id = x.Id,
-                BookingCode = x.BookingCode,
-                FullName = x.FullName,
-                Phone = x.Phone,
-                Email = x.Email,
-                AppointmentDate = x.AppointmentDate,
-                AppointmentTime = x.AppointmentTime,
-                Note = x.Note,
-                TotalAmount = x.TotalAmount,
-                Status = x.Status,
-                PaymentStatus = x.PaymentStatus,
-                CreatedAt = x.CreatedAt,
-                Items = x.BookingDetails.Select(d => new BookingItemDto
-                {
-                    ServiceId = d.ServiceId,
-                    ServiceName = d.Service != null ? d.Service.Name : string.Empty,
-                    Quantity = d.Quantity,
-                    UnitPrice = d.UnitPrice,
-                    LineTotal = d.LineTotal
-                }).ToList()
-            })
-            .ToListAsync();
-
-        return Ok(data);
+        var bookings = await query.OrderByDescending(x => x.CreatedAt).ToListAsync();
+        return Ok(bookings.Select(MapBooking));
     }
 
+    [Authorize]
     [HttpGet("{id:int}")]
     public async Task<ActionResult<BookingDto>> GetById(int id)
     {
-        var entity = await _db.Bookings
+        var booking = await _db.Bookings
             .AsNoTracking()
             .Include(x => x.BookingDetails)
                 .ThenInclude(x => x.Service)
             .FirstOrDefaultAsync(x => x.Id == id);
 
-        if (entity == null) return NotFound(new { message = "Booking not found" });
+        if (booking == null) return NotFound(new { message = "Booking not found" });
 
-        return Ok(new BookingDto
+        var role = User.FindFirstValue(ClaimTypes.Role) ?? string.Empty;
+        var currentEmail = User.FindFirstValue(ClaimTypes.Email)?.Trim().ToLowerInvariant();
+        if (role != "ADMIN" && booking.Email.Trim().ToLowerInvariant() != currentEmail)
+            return Forbid();
+
+        return Ok(MapBooking(booking));
+    }
+
+    [Authorize(Roles = "CUSTOMER")]
+    [HttpGet("availability")]
+    public async Task<ActionResult<AvailabilityDto>> GetAvailability([FromQuery] int serviceId, [FromQuery] DateOnly appointmentDate, [FromQuery] string appointmentTime)
+    {
+        var normalizedTime = NormalizeTime(appointmentTime);
+        if (string.IsNullOrWhiteSpace(normalizedTime))
+            return BadRequest(new { message = "Appointment time is required" });
+
+        var service = await _db.Services.AsNoTracking().FirstOrDefaultAsync(x => x.Id == serviceId && x.Status == "ACTIVE");
+        if (service == null)
+            return NotFound(new { message = "Service not found" });
+
+        var bookedQuantity = await GetBookedQuantityAsync(serviceId, appointmentDate, normalizedTime);
+        return Ok(new AvailabilityDto
         {
-            Id = entity.Id,
-            BookingCode = entity.BookingCode,
-            FullName = entity.FullName,
-            Phone = entity.Phone,
-            Email = entity.Email,
-            AppointmentDate = entity.AppointmentDate,
-            AppointmentTime = entity.AppointmentTime,
-            Note = entity.Note,
-            TotalAmount = entity.TotalAmount,
-            Status = entity.Status,
-            PaymentStatus = entity.PaymentStatus,
-            CreatedAt = entity.CreatedAt,
-            Items = entity.BookingDetails.Select(d => new BookingItemDto
-            {
-                ServiceId = d.ServiceId,
-                ServiceName = d.Service != null ? d.Service.Name : string.Empty,
-                Quantity = d.Quantity,
-                UnitPrice = d.UnitPrice,
-                LineTotal = d.LineTotal
-            }).ToList()
+            ServiceId = serviceId,
+            AppointmentDate = appointmentDate,
+            AppointmentTime = normalizedTime,
+            SlotCapacity = service.SlotCapacity,
+            BookedQuantity = bookedQuantity,
+            RemainingSlots = Math.Max(0, service.SlotCapacity - bookedQuantity)
         });
     }
 
+    [Authorize(Roles = "CUSTOMER")]
     [HttpPost]
     public async Task<ActionResult<BookingDto>> Create(BookingCreateDto dto)
     {
         if (dto.Items == null || dto.Items.Count == 0)
             return BadRequest(new { message = "Booking must have at least one item" });
 
-        // Services are loaded from the database to validate availability and guarantee trusted pricing.
-        var serviceIds = dto.Items.Select(x => x.ServiceId).Distinct().ToList();
+        var currentEmail = User.FindFirstValue(ClaimTypes.Email)?.Trim().ToLowerInvariant();
+        if (string.IsNullOrWhiteSpace(currentEmail))
+            return Unauthorized(new { message = "Invalid token" });
+
+        var customer = await _db.Customers.FirstOrDefaultAsync(x => x.Email.ToLower() == currentEmail);
+        if (customer == null || !customer.IsActive)
+            return Unauthorized(new { message = "Customer account not found or inactive" });
+
+        if (!PhoneHelper.TryNormalizePhone(dto.Phone, dto.Region, out var normalizedPhone, out var phoneError))
+            return BadRequest(new { message = phoneError });
+        var normalizedItems = dto.Items.Select(x => new NormalizedBookingItem
+        {
+            ServiceId = x.ServiceId,
+            Quantity = x.Quantity,
+            AppointmentDate = x.AppointmentDate,
+            AppointmentTime = NormalizeTime(x.AppointmentTime)
+        }).ToList();
+
+        if (normalizedItems.Any(x => x.Quantity <= 0 || string.IsNullOrWhiteSpace(x.AppointmentTime)))
+            return BadRequest(new { message = "Each booking item must have a valid quantity and preferred time" });
+
+        if (normalizedItems.Any(x => x.AppointmentDate < DateOnly.FromDateTime(DateTime.Today)))
+            return BadRequest(new { message = "Appointment date cannot be in the past" });
+
+        if (dto.IsGroupBooking)
+        {
+            if (normalizedItems.Count != 1)
+                return BadRequest(new { message = "Group booking currently supports one service at a time." });
+
+            if (dto.GroupSize <= 1)
+                return BadRequest(new { message = "Group booking requires at least 2 people." });
+
+            if (normalizedItems[0].Quantity != dto.GroupSize)
+                return BadRequest(new { message = "Group size must match the selected service quantity." });
+        }
+        else
+        {
+            var duplicateSlot = normalizedItems
+                .GroupBy(x => new { x.AppointmentDate, x.AppointmentTime })
+                .FirstOrDefault(g => g.Count() > 1);
+
+            if (duplicateSlot != null)
+                return BadRequest(new { message = "Two services cannot use the same appointment date and preferred time in one personal booking." });
+        }
+
+        var userSlotConflicts = await FindUserSlotConflictsAsync(currentEmail, normalizedItems.Select(x => (x.AppointmentDate, x.AppointmentTime)).Distinct().ToList());
+        if (userSlotConflicts.Any())
+        {
+            var first = userSlotConflicts.First();
+            return BadRequest(new { message = $"You already have another booking at {first.AppointmentDate:dd/MM/yyyy} {first.AppointmentTime}. Please choose a different slot." });
+        }
+
+        var serviceIds = normalizedItems.Select(x => x.ServiceId).Distinct().ToList();
         var services = await _db.Services
             .Where(x => serviceIds.Contains(x.Id) && x.Status == "ACTIVE")
             .ToListAsync();
@@ -114,32 +166,56 @@ public class BookingsController : ControllerBase
         if (services.Count != serviceIds.Count)
             return BadRequest(new { message = "One or more services are invalid or inactive" });
 
+        foreach (var item in normalizedItems)
+        {
+            var service = services.First(x => x.Id == item.ServiceId);
+            var bookedQuantity = await GetBookedQuantityAsync(item.ServiceId, item.AppointmentDate, item.AppointmentTime);
+            var remainingSlots = service.SlotCapacity - bookedQuantity;
+
+            if (item.Quantity > remainingSlots)
+            {
+                return BadRequest(new
+                {
+                    message = $"Only {Math.Max(0, remainingSlots)} slot(s) left for {service.Name} at {item.AppointmentDate:dd/MM/yyyy} {item.AppointmentTime}."
+                });
+            }
+        }
+
+        customer.FullName = string.IsNullOrWhiteSpace(dto.FullName) ? customer.FullName : dto.FullName.Trim();
+        customer.Phone = normalizedPhone;
+        customer.UpdatedAt = DateTime.UtcNow;
+
+        var firstSlot = normalizedItems.OrderBy(x => x.AppointmentDate).ThenBy(x => x.AppointmentTime).First();
+        var totalPeople = dto.IsGroupBooking ? dto.GroupSize : 1;
+
         var booking = new Booking
         {
             BookingCode = $"BK-{DateTime.UtcNow:yyyyMMddHHmmss}",
-            FullName = dto.FullName.Trim(),
-            Phone = dto.Phone.Trim(),
-            Email = dto.Email.Trim().ToLower(),
-            AppointmentDate = dto.AppointmentDate,
-            AppointmentTime = dto.AppointmentTime.Trim(),
+            FullName = customer.FullName,
+            Phone = customer.Phone ?? string.Empty,
+            Email = customer.Email,
+            AppointmentDate = firstSlot.AppointmentDate,
+            AppointmentTime = firstSlot.AppointmentTime,
             Note = string.IsNullOrWhiteSpace(dto.Note) ? null : dto.Note.Trim(),
             Status = "PENDING",
             PaymentStatus = "UNPAID",
+            IsGroupBooking = dto.IsGroupBooking,
+            GroupSize = totalPeople,
             CreatedAt = DateTime.UtcNow,
-            UpdatedAt = DateTime.UtcNow
+            UpdatedAt = DateTime.UtcNow,
         };
 
-        foreach (var item in dto.Items)
+        foreach (var item in normalizedItems)
         {
             var service = services.First(x => x.Id == item.ServiceId);
-            var lineTotal = service.Price * item.Quantity;
-
             booking.BookingDetails.Add(new BookingDetail
             {
                 ServiceId = service.Id,
                 Quantity = item.Quantity,
+                AppointmentDate = item.AppointmentDate,
+                AppointmentTime = item.AppointmentTime,
                 UnitPrice = service.Price,
-                LineTotal = lineTotal
+                LineTotal = service.Price * item.Quantity
             });
         }
 
@@ -148,28 +224,125 @@ public class BookingsController : ControllerBase
         _db.Bookings.Add(booking);
         await _db.SaveChangesAsync();
 
-        return CreatedAtAction(nameof(GetById), new { id = booking.Id }, new BookingDto
+        await _db.Entry(booking).Collection(x => x.BookingDetails).Query().Include(x => x.Service).LoadAsync();
+        return CreatedAtAction(nameof(GetById), new { id = booking.Id }, MapBooking(booking));
+    }
+
+    [Authorize(Roles = "ADMIN")]
+    [HttpPatch("{id:int}/status")]
+    public async Task<ActionResult<BookingDto>> UpdateStatus(int id, BookingStatusUpdateDto dto)
+    {
+        var status = (dto.Status ?? string.Empty).Trim().ToUpperInvariant();
+        if (!AdminAllowedStatuses.Contains(status))
+            return BadRequest(new { message = "Invalid booking status" });
+
+        var booking = await _db.Bookings
+            .Include(x => x.BookingDetails)
+                .ThenInclude(x => x.Service)
+            .FirstOrDefaultAsync(x => x.Id == id);
+
+        if (booking == null)
+            return NotFound(new { message = "Booking not found" });
+
+        booking.Status = status;
+        booking.UpdatedAt = DateTime.UtcNow;
+
+        if (status == "CANCELLED")
+            booking.PaymentStatus = booking.PaymentStatus == "PAID" ? "REFUNDED" : booking.PaymentStatus;
+
+        await _db.SaveChangesAsync();
+        return Ok(MapBooking(booking));
+    }
+
+    [Authorize(Roles = "ADMIN")]
+    [HttpDelete("{id:int}")]
+    public async Task<IActionResult> Delete(int id)
+    {
+        var booking = await _db.Bookings
+            .Include(x => x.Payments)
+            .Include(x => x.BookingDetails)
+            .FirstOrDefaultAsync(x => x.Id == id);
+
+        if (booking == null)
+            return NotFound(new { message = "Booking not found" });
+
+        _db.Bookings.Remove(booking);
+        await _db.SaveChangesAsync();
+        return NoContent();
+    }
+
+    private async Task<int> GetBookedQuantityAsync(int serviceId, DateOnly appointmentDate, string appointmentTime)
+    {
+        return await _db.BookingDetails
+            .AsNoTracking()
+            .Include(x => x.Booking)
+            .Where(x => x.ServiceId == serviceId
+                && x.AppointmentDate == appointmentDate
+                && x.AppointmentTime == appointmentTime
+                && x.Booking != null
+                && x.Booking.Status != "CANCELLED")
+            .SumAsync(x => (int?)x.Quantity) ?? 0;
+    }
+
+    private async Task<List<(DateOnly AppointmentDate, string AppointmentTime)>> FindUserSlotConflictsAsync(string currentEmail, List<(DateOnly AppointmentDate, string AppointmentTime)> slots)
+    {
+        var dates = slots.Select(x => x.AppointmentDate).Distinct().ToList();
+        var times = slots.Select(x => x.AppointmentTime).Distinct().ToList();
+
+        var existing = await _db.BookingDetails
+            .AsNoTracking()
+            .Include(x => x.Booking)
+            .Where(x => x.Booking != null
+                && x.Booking.Email.ToLower() == currentEmail
+                && x.Booking.Status != "CANCELLED"
+                && dates.Contains(x.AppointmentDate)
+                && times.Contains(x.AppointmentTime))
+            .Select(x => new { x.AppointmentDate, x.AppointmentTime })
+            .ToListAsync();
+
+        return slots.Where(slot => existing.Any(x => x.AppointmentDate == slot.AppointmentDate && x.AppointmentTime == slot.AppointmentTime)).ToList();
+    }
+
+    private static BookingDto MapBooking(Booking booking)
+    {
+        var firstSlot = booking.BookingDetails.OrderBy(x => x.AppointmentDate).ThenBy(x => x.AppointmentTime).FirstOrDefault();
+
+        return new BookingDto
         {
             Id = booking.Id,
             BookingCode = booking.BookingCode,
             FullName = booking.FullName,
             Phone = booking.Phone,
             Email = booking.Email,
-            AppointmentDate = booking.AppointmentDate,
-            AppointmentTime = booking.AppointmentTime,
+            AppointmentDate = firstSlot?.AppointmentDate ?? booking.AppointmentDate,
+            AppointmentTime = firstSlot?.AppointmentTime ?? booking.AppointmentTime,
             Note = booking.Note,
             TotalAmount = booking.TotalAmount,
             Status = booking.Status,
             PaymentStatus = booking.PaymentStatus,
+            IsGroupBooking = booking.IsGroupBooking,
+            GroupSize = booking.GroupSize,
             CreatedAt = booking.CreatedAt,
-            Items = booking.BookingDetails.Select(d => new BookingItemDto
+            Items = booking.BookingDetails.OrderBy(x => x.AppointmentDate).ThenBy(x => x.AppointmentTime).Select(d => new BookingItemDto
             {
                 ServiceId = d.ServiceId,
-                ServiceName = services.First(x => x.Id == d.ServiceId).Name,
+                ServiceName = d.Service != null ? d.Service.Name : string.Empty,
                 Quantity = d.Quantity,
+                AppointmentDate = d.AppointmentDate,
+                AppointmentTime = d.AppointmentTime,
                 UnitPrice = d.UnitPrice,
                 LineTotal = d.LineTotal
             }).ToList()
-        });
+        };
+    }
+
+    private static string NormalizeTime(string time) => (time ?? string.Empty).Trim().ToUpperInvariant();
+
+    private sealed class NormalizedBookingItem
+    {
+        public int ServiceId { get; set; }
+        public int Quantity { get; set; }
+        public DateOnly AppointmentDate { get; set; }
+        public string AppointmentTime { get; set; } = string.Empty;
     }
 }

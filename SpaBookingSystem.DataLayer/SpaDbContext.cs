@@ -62,6 +62,10 @@ public class SpaDbContext : DbContext
             e.Property(x => x.ImageUrl).HasColumnName("image_url")
                 .HasMaxLength(DataLengths.IMAGE_URL);
 
+            e.Property(x => x.SlotCapacity).HasColumnName("slot_capacity");
+            e.Property(x => x.CreatedAt).HasColumnName("created_at");
+            e.Property(x => x.UpdatedAt).HasColumnName("updated_at");
+
             e.Property(x => x.CategoryId).HasColumnName("category_id");
 
             e.HasOne(x => x.Category)
@@ -101,6 +105,7 @@ public class SpaDbContext : DbContext
             e.Property(x => x.UpdatedAt).HasColumnName("updated_at");
 
             e.HasIndex(x => x.Email).IsUnique();
+            e.HasIndex(x => x.Phone).IsUnique();
         });
 
         modelBuilder.Entity<Admin>(e =>
@@ -174,6 +179,8 @@ public class SpaDbContext : DbContext
                 .HasMaxLength(DataLengths.STATUS)
                 .IsRequired();
 
+            e.Property(x => x.IsGroupBooking).HasColumnName("is_group_booking");
+            e.Property(x => x.GroupSize).HasColumnName("group_size");
             e.Property(x => x.CreatedAt).HasColumnName("created_at");
             e.Property(x => x.UpdatedAt).HasColumnName("updated_at");
         });
@@ -187,6 +194,10 @@ public class SpaDbContext : DbContext
             e.Property(x => x.BookingId).HasColumnName("booking_id");
             e.Property(x => x.ServiceId).HasColumnName("service_id");
             e.Property(x => x.Quantity).HasColumnName("quantity");
+            e.Property(x => x.AppointmentDate).HasColumnName("appointment_date").HasColumnType("date");
+            e.Property(x => x.AppointmentTime).HasColumnName("appointment_time")
+                .HasMaxLength(20)
+                .IsRequired();
 
             e.Property(x => x.UnitPrice).HasColumnName("unit_price")
                 .HasColumnType("decimal(10,2)");

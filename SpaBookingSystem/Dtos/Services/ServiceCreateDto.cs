@@ -19,11 +19,12 @@ public class ServiceCreateDto
     [Range(1, 10000)]
     public int Duration { get; set; }
 
+    [Range(1, 100)]
+    public int SlotCapacity { get; set; } = 5;
+
     [MaxLength(DataLengths.STATUS)]
     public string? Status { get; set; }
 
     public int CategoryId { get; set; }
-
-    // ImageFile is optional to support services without a photo at creation time.
     public IFormFile? ImageFile { get; set; }
 }

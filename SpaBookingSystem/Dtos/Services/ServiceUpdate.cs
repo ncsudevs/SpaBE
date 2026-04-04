@@ -19,11 +19,12 @@ public class ServiceUpdateDto
     [Range(1, 10000)]
     public int Duration { get; set; }
 
+    [Range(1, 100)]
+    public int SlotCapacity { get; set; } = 5;
+
     [MaxLength(DataLengths.STATUS)]
     public string? Status { get; set; }
 
     public int CategoryId { get; set; }
-
-    // Sending a new file replaces the current image; omitting it keeps the existing file.
     public IFormFile? ImageFile { get; set; }
 }

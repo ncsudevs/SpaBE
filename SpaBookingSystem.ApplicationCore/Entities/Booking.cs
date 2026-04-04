@@ -34,10 +34,12 @@ public class Booking
     [MaxLength(DataLengths.STATUS)]
     public string PaymentStatus { get; set; } = "UNPAID";
 
+    public bool IsGroupBooking { get; set; }
+    public int GroupSize { get; set; } = 1;
+
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
 
-    // Child collections are initialized to avoid null checks when the controller builds details/payments.
     public List<BookingDetail> BookingDetails { get; set; } = new();
     public List<Payment> Payments { get; set; } = new();
 }
