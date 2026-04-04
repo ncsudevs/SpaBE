@@ -33,6 +33,7 @@ public class BookingsController : ControllerBase
             .AsNoTracking()
             .Include(x => x.BookingDetails)
                 .ThenInclude(x => x.Service)
+            .Include(x => x.Payments)
             .AsQueryable();
 
         if (role == "ADMIN")
@@ -63,6 +64,7 @@ public class BookingsController : ControllerBase
             .AsNoTracking()
             .Include(x => x.BookingDetails)
                 .ThenInclude(x => x.Service)
+            .Include(x => x.Payments)
             .FirstOrDefaultAsync(x => x.Id == id);
 
         if (booking == null) return NotFound(new { message = "Booking not found" });
@@ -322,7 +324,13 @@ public class BookingsController : ControllerBase
             PaymentStatus = booking.PaymentStatus,
             IsGroupBooking = booking.IsGroupBooking,
             GroupSize = booking.GroupSize,
-            CreatedAt = booking.CreatedAt,
+            CreatedAt = ToUtc(booking.CreatedAt),
+            UpdatedAt = ToUtc(booking.UpdatedAt),
+            PaymentAttempts = booking.PaymentAttempts,
+            LastPaymentCreatedAt = booking.Payments?
+                .OrderByDescending(p => p.PaidAt)
+                .Select(p => (DateTime?)ToUtc(p.PaidAt))
+                .FirstOrDefault(),
             Items = booking.BookingDetails.OrderBy(x => x.AppointmentDate).ThenBy(x => x.AppointmentTime).Select(d => new BookingItemDto
             {
                 ServiceId = d.ServiceId,
@@ -337,6 +345,12 @@ public class BookingsController : ControllerBase
     }
 
     private static string NormalizeTime(string time) => (time ?? string.Empty).Trim().ToUpperInvariant();
+
+    private static DateTime ToUtc(DateTime value)
+    {
+        if (value.Kind == DateTimeKind.Utc) return value;
+        return DateTime.SpecifyKind(value, DateTimeKind.Utc);
+    }
 
     private sealed class NormalizedBookingItem
     {

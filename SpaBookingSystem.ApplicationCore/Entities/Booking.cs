@@ -34,6 +34,8 @@ public class Booking
     [MaxLength(DataLengths.STATUS)]
     public string PaymentStatus { get; set; } = "UNPAID";
 
+    public int PaymentAttempts { get; set; } = 0;
+
     public bool IsGroupBooking { get; set; }
     public int GroupSize { get; set; } = 1;
 

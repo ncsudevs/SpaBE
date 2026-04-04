@@ -16,5 +16,8 @@ public class BookingDto
     public bool IsGroupBooking { get; set; }
     public int GroupSize { get; set; }
     public DateTime CreatedAt { get; set; }
+    public DateTime UpdatedAt { get; set; }
+    public int PaymentAttempts { get; set; }
+    public DateTime? LastPaymentCreatedAt { get; set; }
     public List<BookingItemDto> Items { get; set; } = new();
 }

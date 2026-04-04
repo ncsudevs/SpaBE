@@ -20,7 +20,9 @@ public class PaymentsController : ControllerBase
 {
     private static readonly string[] AllowedMethods = ["MOMO", "BANK_TRANSFER", "CARD", "WALLET"];
     private static readonly string[] AdminAllowedStatuses = ["PENDING", "PAID", "REJECTED", "REFUNDED"];
-    private static readonly TimeSpan PaymentTtl = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan PaymentTtl = TimeSpan.FromMinutes(1);
+    //private static readonly TimeSpan PaymentTtl = TimeSpan.FromSeconds(10);
+    private const int MaxPaymentAttempts = 3; // 1 initial + 2 retries
 
     private readonly SpaDbContext _db;
     private readonly IEmailSender _emailSender;
@@ -141,8 +143,8 @@ public class PaymentsController : ControllerBase
                     ipn = BuildIpnUrl();
                     var extraData = BuildExtraData(booking, existingPending);
                     var requestId = $"REQ-{existingPending.PaymentCode}-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}";
-                    var orderIdReuse = existingPending.TransactionCode ?? $"MOMO-{booking.BookingCode}-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}";
-                    existingPending.TransactionCode = orderIdReuse;
+                    var newOrderId = $"MOMO-{booking.BookingCode}-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}";
+                    existingPending.TransactionCode = newOrderId;
 
                     var momoRequestReuse = new MomoCreatePaymentRequest
                     {
@@ -150,7 +152,7 @@ public class PaymentsController : ControllerBase
                         PartnerCode = _momoOptions.PartnerCode,
                         RequestId = requestId,
                         Amount = Convert.ToInt64(existingPending.Amount),
-                        OrderId = orderIdReuse,
+                        OrderId = newOrderId,
                         OrderInfo = $"SuSpa payment for {booking.BookingCode}",
                         RedirectUrl = redirect,
                         IpnUrl = ipn,
@@ -213,9 +215,19 @@ public class PaymentsController : ControllerBase
             return BadRequest(new { message = "This booking already has a payment request" });
         }
 
+        if (booking.PaymentAttempts >= MaxPaymentAttempts)
+        {
+            return BadRequest(new { message = "Payment retry limit reached for this booking." });
+        }
+
+        if (booking.AppointmentDate < DateOnly.FromDateTime(DateTime.UtcNow.Date))
+        {
+            return BadRequest(new { message = "This booking date has passed. Payment is no longer available." });
+        }
+
         var paymentCode = $"PAY-{DateTime.UtcNow:yyyyMMddHHmmss}";
         var orderId = $"MOMO-{booking.BookingCode}-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}";
-        var momoAmount = Convert.ToInt64(decimal.Round(booking.TotalAmount * 1000m, 0, MidpointRounding.AwayFromZero));
+        var momoAmount = Convert.ToInt64(decimal.Round(booking.TotalAmount, 0, MidpointRounding.AwayFromZero));
         var payment = new Payment
         {
             BookingId = booking.Id,
@@ -231,6 +243,8 @@ public class PaymentsController : ControllerBase
                 : $"TXN-{Guid.NewGuid().ToString("N")[..10].ToUpperInvariant()}"
         };
 
+        booking.PaymentAttempts += 1;
+
         MomoCreatePaymentResponse? momoResponse = null;
 
         if (method == "MOMO")
@@ -241,6 +255,15 @@ public class PaymentsController : ControllerBase
                 || string.IsNullOrWhiteSpace(_momoOptions.SecretKey))
             {
                 return BadRequest(new { message = "MoMo sandbox is not configured yet. Please update appsettings.json with PartnerCode, AccessKey and SecretKey." });
+            }
+
+            if (momoAmount < 1000 || momoAmount > 50_000_000)
+            {
+                return BadRequest(new
+                {
+                    message = "MoMo requires amount between 1,000 VND and 50,000,000 VND. Please update service prices to VND.",
+                    amount = momoAmount
+                });
             }
 
             try
@@ -392,6 +415,22 @@ public class PaymentsController : ControllerBase
             return NoContent();
         }
 
+        // TTL guard: reject IPN if the payment session expired.
+        var expired = payment.PaidAt.Add(PaymentTtl) <= DateTime.UtcNow;
+        if (expired)
+        {
+            payment.Status = "REJECTED";
+            payment.Booking.PaymentStatus = "REJECTED";
+            if (payment.Booking.Status == "CONFIRMED")
+            {
+                payment.Booking.Status = "PENDING";
+            }
+            payment.Booking.UpdatedAt = DateTime.UtcNow;
+            await _db.SaveChangesAsync(cancellationToken);
+            _logger.LogInformation("Ignored MoMo IPN because session expired for order {OrderId}", request.OrderId);
+            return NoContent();
+        }
+
         if (payment.Amount != request.Amount || !string.Equals(request.PartnerCode, _momoOptions.PartnerCode, StringComparison.Ordinal))
         {
             _logger.LogWarning("Rejected MoMo IPN because amount or partner code mismatched for order {OrderId}", request.OrderId);
@@ -421,10 +460,7 @@ public class PaymentsController : ControllerBase
         {
             payment.Status = "REJECTED";
             payment.Booking.PaymentStatus = "REJECTED";
-            if (payment.Booking.Status == "CONFIRMED")
-            {
-                payment.Booking.Status = "PENDING";
-            }
+            payment.Booking.Status = "CANCELLED";
 
             await _emailSender.SendAsync(
                 payment.Booking.Email,
@@ -599,7 +635,7 @@ public class PaymentsController : ControllerBase
             Method = payment.Method,
             Amount = payment.Amount,
             Status = payment.Status,
-            PaidAt = payment.PaidAt,
+            PaidAt = ToUtc(payment.PaidAt),
             TransactionCode = payment.TransactionCode,
             ProviderName = providerName,
             AccountNumber = accountNumber,
@@ -611,5 +647,11 @@ public class PaymentsController : ControllerBase
             QrCodeUrl = momo?.QrCodeUrl,
             IsSandbox = isSandbox
         };
+    }
+
+    private static DateTime ToUtc(DateTime value)
+    {
+        if (value.Kind == DateTimeKind.Utc) return value;
+        return DateTime.SpecifyKind(value, DateTimeKind.Utc);
     }
 }
