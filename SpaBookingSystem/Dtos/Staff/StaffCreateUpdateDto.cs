@@ -8,4 +8,5 @@ public class StaffCreateUpdateDto
     public string? Skills { get; set; }
     public bool IsActive { get; set; } = true;
     public int MaxConcurrent { get; set; } = 1;
+    public List<int> CategoryIds { get; set; } = new();
 }

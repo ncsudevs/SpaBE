@@ -263,6 +263,53 @@ public class BookingsController : ControllerBase
     }
 
     [Authorize(Roles = "ADMIN")]
+    [HttpPatch("details/{detailId:int}/staff")]
+    public async Task<ActionResult<BookingDto>> UpdateDetailStaff(int detailId, BookingStaffUpdateDto dto)
+    {
+        var detail = await _db.BookingDetails
+            .Include(d => d.Service)
+            .Include(d => d.Booking)
+            .FirstOrDefaultAsync(d => d.Id == detailId);
+
+        if (detail == null || detail.Booking == null)
+            return NotFound(new { message = "Booking detail not found" });
+
+        var staff = await _db.Staffs
+            .Include(s => s.StaffCategories)
+            .FirstOrDefaultAsync(s => s.Id == dto.StaffId && s.IsActive);
+
+        if (staff == null)
+            return NotFound(new { message = "Staff not found or inactive" });
+
+        if (detail.Service == null || !staff.StaffCategories.Any(sc => sc.CategoryId == detail.Service.CategoryId))
+            return Conflict(new { message = "Staff does not match the service category." });
+
+        var duration = detail.Service.Duration;
+        var start = ParseTimeToMinutes(detail.AppointmentTime);
+        if (start == null)
+            return BadRequest(new { message = "Invalid appointment time." });
+
+        var available = await IsStaffAvailableForSlot(
+            staff,
+            detail.AppointmentDate,
+            detail.AppointmentTime!,
+            duration,
+            ignoreDetailId: detail.Id);
+
+        if (!available)
+            return Conflict(new { message = "Staff is busy at this time slot." });
+
+        detail.StaffId = staff.Id;
+        detail.Booking.UpdatedAt = DateTime.UtcNow;
+        await _db.SaveChangesAsync();
+
+        await _db.Entry(detail.Booking).Collection(b => b.BookingDetails).Query().Include(x => x.Service).Include(x => x.Staff).LoadAsync();
+        await _db.Entry(detail.Booking).Collection(b => b.Payments).LoadAsync();
+
+        return Ok(MapBooking(detail.Booking));
+    }
+
+    [Authorize(Roles = "ADMIN")]
     [HttpDelete("{id:int}")]
     public async Task<IActionResult> Delete(int id)
     {
@@ -354,6 +401,37 @@ public class BookingsController : ControllerBase
             .ToListAsync();
 
         return slots.Where(slot => existing.Any(x => x.AppointmentDate == slot.AppointmentDate && x.AppointmentTime == slot.AppointmentTime)).ToList();
+    }
+
+    private async Task<bool> IsStaffAvailableForSlot(Staff staff, DateOnly date, string time, int durationMinutes, int? ignoreDetailId = null)
+    {
+        var start = ParseTimeToMinutes(time);
+        if (start == null) return false;
+        var targetEnd = start.Value + Math.Max(1, durationMinutes);
+
+        var assigned = await _db.BookingDetails
+            .AsNoTracking()
+            .Include(d => d.Service)
+            .Include(d => d.Booking)
+            .Where(d => d.StaffId == staff.Id
+                && d.AppointmentDate == date
+                && d.Booking != null
+                && d.Booking.Status != "CANCELLED"
+                && d.Id != ignoreDetailId)
+            .ToListAsync();
+
+        var overlapCount = 0;
+        foreach (var d in assigned)
+        {
+            var existingStart = ParseTimeToMinutes(d.AppointmentTime);
+            if (existingStart == null) continue;
+            var existingDuration = d.Service?.Duration ?? durationMinutes;
+            var existingEnd = existingStart.Value + Math.Max(1, existingDuration);
+            var overlap = existingStart.Value < targetEnd && start.Value < existingEnd;
+            if (overlap) overlapCount += 1;
+        }
+
+        return overlapCount < staff.MaxConcurrent;
     }
 
     private static BookingDto MapBooking(Booking booking)

@@ -12,7 +12,7 @@ using SpaBookingSystem.DataLayer;
 namespace SpaBookingSystem.DataLayer.Migrations
 {
     [DbContext(typeof(SpaDbContext))]
-    [Migration("20260405070515_AddStaffAndBookingStaff")]
+    [Migration("20260405070649_AddStaffAndBookingStaff")]
     partial class AddStaffAndBookingStaff
     {
         /// <inheritdoc />

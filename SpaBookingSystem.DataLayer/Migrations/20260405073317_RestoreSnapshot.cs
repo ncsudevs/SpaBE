@@ -5,7 +5,7 @@
 namespace SpaBookingSystem.DataLayer.Migrations
 {
     /// <inheritdoc />
-    public partial class AddStaffAndBookingStaff : Migration
+    public partial class RestoreSnapshot : Migration
     {
         /// <inheritdoc />
         protected override void Up(MigrationBuilder migrationBuilder)

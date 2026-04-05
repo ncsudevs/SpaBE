@@ -26,4 +26,5 @@ public class Staff
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
 
     public List<BookingDetail> BookingDetails { get; set; } = new();
+    public List<StaffServiceCategory> StaffCategories { get; set; } = new();
 }

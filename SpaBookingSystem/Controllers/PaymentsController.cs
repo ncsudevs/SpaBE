@@ -18,9 +18,9 @@ namespace SpaBookingSystem.Api.Controllers;
 [Route("api/payments")]
 public class PaymentsController : ControllerBase
 {
-    private static readonly string[] AllowedMethods = ["MOMO", "BANK_TRANSFER", "CARD", "WALLET"];
+    private static readonly string[] AllowedMethods = ["MOMO"];
     private static readonly string[] AdminAllowedStatuses = ["PENDING", "PAID", "REJECTED", "REFUNDED"];
-    private static readonly TimeSpan PaymentTtl = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan PaymentTtl = TimeSpan.FromMinutes(5);
     //private static readonly TimeSpan PaymentTtl = TimeSpan.FromSeconds(10);
     private const int MaxPaymentAttempts = 3; // 1 initial + 2 retries
 
@@ -447,6 +447,8 @@ public class PaymentsController : ControllerBase
             payment.Booking.PaymentStatus = "PAID";
             payment.Booking.Status = "CONFIRMED";
 
+            await AutoAssignStaffAsync(payment.Booking, cancellationToken);
+
             await _emailSender.SendAsync(
                 payment.Booking.Email,
                 "SuSpa payment confirmed",
@@ -510,6 +512,8 @@ public class PaymentsController : ControllerBase
             if (status == "PAID")
             {
                 payment.Booking.Status = "CONFIRMED";
+                await AutoAssignStaffAsync(payment.Booking, HttpContext.RequestAborted);
+
                 await _emailSender.SendAsync(
                     payment.Booking.Email,
                     "SuSpa payment confirmed",
@@ -610,17 +614,9 @@ public class PaymentsController : ControllerBase
 
     private static PaymentDto MapPayment(Payment payment, MomoCreatePaymentResponse? momo = null, bool isSandbox = false)
     {
-        var providerName = payment.Method switch
-        {
-            "MOMO" => "MoMo E-Wallet",
-            "BANK_TRANSFER" => "ACB Bank",
-            "CARD" => "Card Gateway",
-            "WALLET" => "Digital Wallet",
-            _ => payment.Method
-        };
-
-        var accountNumber = payment.Method == "MOMO" ? "0901234567" : "123456789";
-        var accountName = payment.Method == "MOMO" ? "CONG TY SUSPA MOMO" : "CONG TY TNHH SUSPA";
+        var providerName = "MoMo E-Wallet";
+        var accountNumber = "0901234567";
+        var accountName = "CONG TY SUSPA MOMO";
         var paymentContent = $"{payment.PaymentCode} {payment.Booking?.BookingCode ?? string.Empty}".Trim();
         var qrNote = payment.Method == "MOMO"
             ? "You will be redirected to the official MoMo sandbox payment page to scan the QR code."
@@ -653,5 +649,131 @@ public class PaymentsController : ControllerBase
     {
         if (value.Kind == DateTimeKind.Utc) return value;
         return DateTime.SpecifyKind(value, DateTimeKind.Utc);
+    }
+
+    private async Task AutoAssignStaffAsync(Booking booking, CancellationToken cancellationToken)
+    {
+        await _db.Entry(booking)
+            .Collection(b => b.BookingDetails)
+            .Query()
+            .Include(d => d.Service)
+            .LoadAsync(cancellationToken);
+
+        var pendingDetails = booking.BookingDetails
+            .Where(d => d.StaffId == null && d.Service != null)
+            .ToList();
+
+        if (pendingDetails.Count == 0) return;
+
+        var appointmentDates = pendingDetails.Select(d => d.AppointmentDate).Distinct().ToList();
+        var categoryIds = pendingDetails.Select(d => d.Service!.CategoryId).Distinct().ToList();
+
+        var staffPool = await _db.Staffs
+            .AsNoTracking()
+            .Include(s => s.StaffCategories)
+            .Where(s => s.IsActive && s.StaffCategories.Any(sc => categoryIds.Contains(sc.CategoryId)))
+            .ToListAsync(cancellationToken);
+
+        if (staffPool.Count == 0)
+        {
+            _logger.LogInformation("Auto-assign skipped: no active staff matching categories {Categories}", string.Join(',', categoryIds));
+            return;
+        }
+
+        var assignedDetails = await _db.BookingDetails
+            .AsNoTracking()
+            .Include(d => d.Service)
+            .Include(d => d.Booking)
+            .Where(d => d.StaffId != null
+                && appointmentDates.Contains(d.AppointmentDate)
+                && d.Booking != null
+                && d.Booking.Status != "CANCELLED")
+            .ToListAsync(cancellationToken);
+
+        var newAssignments = new List<BookingDetail>();
+
+        foreach (var detail in pendingDetails)
+        {
+            var start = ParseTimeToMinutes(detail.AppointmentTime);
+            if (start == null || detail.Service == null) continue;
+
+            var duration = detail.Service.Duration;
+            var end = start.Value + Math.Max(1, duration);
+
+            var candidates = staffPool
+                .Where(s => s.StaffCategories.Any(sc => sc.CategoryId == detail.Service.CategoryId))
+                .ToList();
+
+            Staff? chosen = null;
+            int? chosenLoad = null;
+
+            foreach (var staff in candidates)
+            {
+                var overlapCount = assignedDetails
+                    .Where(x => x.StaffId == staff.Id && x.AppointmentDate == detail.AppointmentDate)
+                    .Count(x =>
+                    {
+                        var s = ParseTimeToMinutes(x.AppointmentTime);
+                        if (s == null) return false;
+                        var e = s.Value + Math.Max(1, (x.Service?.Duration ?? duration));
+                        return s.Value < end && start.Value < e;
+                    });
+
+                overlapCount += newAssignments
+                    .Where(x => x.StaffId == staff.Id && x.AppointmentDate == detail.AppointmentDate)
+                    .Count(x =>
+                    {
+                        var s = ParseTimeToMinutes(x.AppointmentTime);
+                        if (s == null) return false;
+                        var e = s.Value + Math.Max(1, (x.Service?.Duration ?? duration));
+                        return s.Value < end && start.Value < e;
+                    });
+
+                if (overlapCount < staff.MaxConcurrent)
+                {
+                    if (chosen == null || overlapCount < chosenLoad || (overlapCount == chosenLoad && staff.Id < chosen.Id))
+                    {
+                        chosen = staff;
+                        chosenLoad = overlapCount;
+                    }
+                }
+            }
+
+            if (chosen != null)
+            {
+                detail.StaffId = chosen.Id;
+                newAssignments.Add(detail);
+                assignedDetails.Add(detail);
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "Auto-assign could not find available staff for booking {BookingCode} detail {DetailId} at {Date} {Time}, category {CategoryId}",
+                    booking.BookingCode,
+                    detail.Id,
+                    detail.AppointmentDate,
+                    detail.AppointmentTime,
+                    detail.Service.CategoryId);
+            }
+        }
+
+        booking.UpdatedAt = DateTime.UtcNow;
+    }
+
+    private static int? ParseTimeToMinutes(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        if (DateTime.TryParse(value, out var dt))
+        {
+            return dt.Hour * 60 + dt.Minute;
+        }
+
+        var parts = value.Split(':');
+        if (parts.Length >= 2 && int.TryParse(parts[0], out var h) && int.TryParse(parts[1].Substring(0, 2), out var m))
+        {
+            return (h % 24) * 60 + Math.Clamp(m, 0, 59);
+        }
+
+        return null;
     }
 }

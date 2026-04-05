@@ -16,6 +16,7 @@ public class SpaDbContext : DbContext
     public DbSet<BookingDetail> BookingDetails => Set<BookingDetail>();
     public DbSet<Payment> Payments => Set<Payment>();
     public DbSet<Staff> Staffs => Set<Staff>();
+    public DbSet<StaffServiceCategory> StaffServiceCategories => Set<StaffServiceCategory>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -165,6 +166,22 @@ public class SpaDbContext : DbContext
 
             e.HasIndex(x => x.Email).IsUnique().HasFilter("[email] IS NOT NULL");
             e.HasIndex(x => x.Phone).IsUnique().HasFilter("[phone] IS NOT NULL");
+        });
+
+        modelBuilder.Entity<StaffServiceCategory>(e =>
+        {
+            e.ToTable("staff_service_categories");
+            e.HasKey(x => new { x.StaffId, x.CategoryId });
+
+            e.HasOne(x => x.Staff)
+                .WithMany(x => x.StaffCategories)
+                .HasForeignKey(x => x.StaffId)
+                .OnDelete(DeleteBehavior.Cascade);
+
+            e.HasOne(x => x.Category)
+                .WithMany()
+                .HasForeignKey(x => x.CategoryId)
+                .OnDelete(DeleteBehavior.Cascade);
         });
 
         modelBuilder.Entity<Booking>(e =>
