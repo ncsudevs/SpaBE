@@ -15,6 +15,7 @@ public class SpaDbContext : DbContext
     public DbSet<Booking> Bookings => Set<Booking>();
     public DbSet<BookingDetail> BookingDetails => Set<BookingDetail>();
     public DbSet<Payment> Payments => Set<Payment>();
+    public DbSet<Staff> Staffs => Set<Staff>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -138,6 +139,34 @@ public class SpaDbContext : DbContext
             e.HasIndex(x => x.Email).IsUnique();
         });
 
+        modelBuilder.Entity<Staff>(e =>
+        {
+            e.ToTable("staff");
+            e.HasKey(x => x.Id);
+
+            e.Property(x => x.Id).HasColumnName("staff_id");
+            e.Property(x => x.FullName).HasColumnName("full_name")
+                .HasMaxLength(DataLengths.NAME)
+                .IsRequired();
+
+            e.Property(x => x.Email).HasColumnName("email")
+                .HasMaxLength(DataLengths.EMAIL);
+
+            e.Property(x => x.Phone).HasColumnName("phone")
+                .HasMaxLength(20);
+
+            e.Property(x => x.Skills).HasColumnName("skills")
+                .HasMaxLength(DataLengths.SHORT_DESCRIPTION);
+
+            e.Property(x => x.IsActive).HasColumnName("is_active");
+            e.Property(x => x.MaxConcurrent).HasColumnName("max_concurrent");
+            e.Property(x => x.CreatedAt).HasColumnName("created_at");
+            e.Property(x => x.UpdatedAt).HasColumnName("updated_at");
+
+            e.HasIndex(x => x.Email).IsUnique().HasFilter("[email] IS NOT NULL");
+            e.HasIndex(x => x.Phone).IsUnique().HasFilter("[phone] IS NOT NULL");
+        });
+
         modelBuilder.Entity<Booking>(e =>
         {
             e.ToTable("bookings");
@@ -198,6 +227,7 @@ public class SpaDbContext : DbContext
             e.Property(x => x.AppointmentTime).HasColumnName("appointment_time")
                 .HasMaxLength(20)
                 .IsRequired();
+            e.Property(x => x.StaffId).HasColumnName("staff_id");
 
             e.Property(x => x.UnitPrice).HasColumnName("unit_price")
                 .HasColumnType("decimal(10,2)");
@@ -214,6 +244,11 @@ public class SpaDbContext : DbContext
                 .WithMany()
                 .HasForeignKey(x => x.ServiceId)
                 .OnDelete(DeleteBehavior.Restrict);
+
+            e.HasOne(x => x.Staff)
+                .WithMany(x => x.BookingDetails)
+                .HasForeignKey(x => x.StaffId)
+                .OnDelete(DeleteBehavior.SetNull);
         });
 
         modelBuilder.Entity<Payment>(e =>

@@ -33,6 +33,8 @@ public class BookingsController : ControllerBase
             .AsNoTracking()
             .Include(x => x.BookingDetails)
                 .ThenInclude(x => x.Service)
+            .Include(x => x.BookingDetails)
+                .ThenInclude(x => x.Staff)
             .Include(x => x.Payments)
             .AsQueryable();
 
@@ -64,6 +66,8 @@ public class BookingsController : ControllerBase
             .AsNoTracking()
             .Include(x => x.BookingDetails)
                 .ThenInclude(x => x.Service)
+            .Include(x => x.BookingDetails)
+                .ThenInclude(x => x.Staff)
             .Include(x => x.Payments)
             .FirstOrDefaultAsync(x => x.Id == id);
 
@@ -89,7 +93,7 @@ public class BookingsController : ControllerBase
         if (service == null)
             return NotFound(new { message = "Service not found" });
 
-        var bookedQuantity = await GetBookedQuantityAsync(serviceId, appointmentDate, normalizedTime);
+        var bookedQuantity = await GetBookedQuantityAsync(serviceId, appointmentDate, normalizedTime, service.Duration);
         return Ok(new AvailabilityDto
         {
             ServiceId = serviceId,
@@ -171,7 +175,7 @@ public class BookingsController : ControllerBase
         foreach (var item in normalizedItems)
         {
             var service = services.First(x => x.Id == item.ServiceId);
-            var bookedQuantity = await GetBookedQuantityAsync(item.ServiceId, item.AppointmentDate, item.AppointmentTime);
+            var bookedQuantity = await GetBookedQuantityAsync(item.ServiceId, item.AppointmentDate, item.AppointmentTime, service.Duration);
             var remainingSlots = service.SlotCapacity - bookedQuantity;
 
             if (item.Quantity > remainingSlots)
@@ -226,7 +230,7 @@ public class BookingsController : ControllerBase
         _db.Bookings.Add(booking);
         await _db.SaveChangesAsync();
 
-        await _db.Entry(booking).Collection(x => x.BookingDetails).Query().Include(x => x.Service).LoadAsync();
+        await _db.Entry(booking).Collection(x => x.BookingDetails).Query().Include(x => x.Service).Include(x => x.Staff).LoadAsync();
         return CreatedAtAction(nameof(GetById), new { id = booking.Id }, MapBooking(booking));
     }
 
@@ -241,6 +245,8 @@ public class BookingsController : ControllerBase
         var booking = await _db.Bookings
             .Include(x => x.BookingDetails)
                 .ThenInclude(x => x.Service)
+            .Include(x => x.BookingDetails)
+                .ThenInclude(x => x.Staff)
             .FirstOrDefaultAsync(x => x.Id == id);
 
         if (booking == null)
@@ -263,6 +269,7 @@ public class BookingsController : ControllerBase
         var booking = await _db.Bookings
             .Include(x => x.Payments)
             .Include(x => x.BookingDetails)
+                .ThenInclude(x => x.Staff)
             .FirstOrDefaultAsync(x => x.Id == id);
 
         if (booking == null)
@@ -273,17 +280,61 @@ public class BookingsController : ControllerBase
         return NoContent();
     }
 
-    private async Task<int> GetBookedQuantityAsync(int serviceId, DateOnly appointmentDate, string appointmentTime)
+    private async Task<int> GetBookedQuantityAsync(int serviceId, DateOnly appointmentDate, string appointmentTime, int targetDurationMinutes)
     {
-        return await _db.BookingDetails
+        var targetStart = ParseTimeToMinutes(appointmentTime);
+        if (targetStart == null) return 0;
+
+        var details = await _db.BookingDetails
             .AsNoTracking()
             .Include(x => x.Booking)
+            .Include(x => x.Service)
             .Where(x => x.ServiceId == serviceId
                 && x.AppointmentDate == appointmentDate
-                && x.AppointmentTime == appointmentTime
                 && x.Booking != null
                 && x.Booking.Status != "CANCELLED")
-            .SumAsync(x => (int?)x.Quantity) ?? 0;
+            .Select(x => new
+            {
+                x.Quantity,
+                x.AppointmentTime,
+                Duration = x.Service != null ? x.Service.Duration : (int?)null
+            })
+            .ToListAsync();
+
+        var targetEnd = targetStart.Value + Math.Max(1, targetDurationMinutes);
+        var total = 0;
+
+        foreach (var d in details)
+        {
+            var existingStart = ParseTimeToMinutes(d.AppointmentTime);
+            if (existingStart == null) continue;
+            var existingDuration = d.Duration ?? targetDurationMinutes;
+            var existingEnd = existingStart.Value + Math.Max(1, existingDuration);
+
+            var overlap = existingStart.Value < targetEnd && targetStart.Value < existingEnd;
+            if (overlap)
+            {
+                total += d.Quantity;
+            }
+        }
+
+        return total;
+    }
+
+    private static int? ParseTimeToMinutes(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        if (DateTime.TryParse(value, out var dt))
+        {
+            return dt.Hour * 60 + dt.Minute;
+        }
+        // fallback for formats like "09:00" without date
+        var parts = value.Split(':');
+        if (parts.Length >= 2 && int.TryParse(parts[0], out var h) && int.TryParse(parts[1].Substring(0, 2), out var m))
+        {
+            return (h % 24) * 60 + Math.Clamp(m, 0, 59);
+        }
+        return null;
     }
 
     private async Task<List<(DateOnly AppointmentDate, string AppointmentTime)>> FindUserSlotConflictsAsync(string currentEmail, List<(DateOnly AppointmentDate, string AppointmentTime)> slots)
@@ -338,6 +389,8 @@ public class BookingsController : ControllerBase
                 Quantity = d.Quantity,
                 AppointmentDate = d.AppointmentDate,
                 AppointmentTime = d.AppointmentTime,
+                StaffId = d.StaffId,
+                StaffName = d.Staff?.FullName,
                 UnitPrice = d.UnitPrice,
                 LineTotal = d.LineTotal
             }).ToList()
