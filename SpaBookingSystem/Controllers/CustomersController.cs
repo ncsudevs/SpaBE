@@ -300,7 +300,7 @@ public class CustomersController : ControllerBase
 
     private static bool IsEffectiveCheckedIn(Booking booking) =>
         booking.IsCheckedIn
-        && booking.Status == BookingStatusNames.Confirmed
+        && (booking.Status == BookingStatusNames.Confirmed || booking.Status == BookingStatusNames.Completed)
         && booking.PaymentStatus == PaymentStatusNames.Paid;
 
     private static string GetWorkflowStatusLabel(Booking booking) =>

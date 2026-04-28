@@ -371,6 +371,9 @@ public class BookingsController : ControllerBase
         {
             if (booking.Status != BookingStatusNames.Confirmed)
                 return Conflict(new { message = "Only confirmed bookings can be checked in." });
+
+            if (!_bookingStaffingService.IsFullyStaffed(booking))
+                return Conflict(new { message = "Assign enough staff quantity to every booking item before checking in." });
         }
         else if (booking.Status == BookingStatusNames.Completed)
         {
@@ -379,6 +382,9 @@ public class BookingsController : ControllerBase
 
         booking.IsCheckedIn = dto.IsCheckedIn;
         booking.CheckedInAt = dto.IsCheckedIn ? DateTime.UtcNow : null;
+        booking.Status = dto.IsCheckedIn
+            ? BookingStatusNames.Completed
+            : booking.Status;
         booking.UpdatedAt = DateTime.UtcNow;
 
         await _db.SaveChangesAsync();
@@ -727,7 +733,7 @@ public class BookingsController : ControllerBase
 
     private static bool IsEffectiveCheckedIn(Booking booking) =>
         booking.IsCheckedIn
-        && booking.Status == BookingStatusNames.Confirmed
+        && (booking.Status == BookingStatusNames.Confirmed || booking.Status == BookingStatusNames.Completed)
         && booking.PaymentStatus == PaymentStatusNames.Paid;
 
     private static string GetWorkflowStatusLabel(Booking booking) =>

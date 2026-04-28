@@ -160,69 +160,21 @@ public class PaymentsController : ControllerBase
             if (latestActivePayment.Method == PaymentMethodNames.BankTransfer && method == PaymentMethodNames.BankTransfer)
                 return Ok(MapPayment(latestActivePayment));
 
+            if (latestActivePayment.Method == PaymentMethodNames.Momo && method == PaymentMethodNames.BankTransfer)
+            {
+                latestActivePayment.Status = PaymentStatusNames.Rejected;
+                booking.PaymentStatus = PaymentStatusNames.Rejected;
+                booking.Status = BookingStatusNames.Pending;
+                ResetCheckIn(booking);
+                booking.UpdatedAt = DateTime.UtcNow;
+                await _db.SaveChangesAsync(cancellationToken);
+                return await CreateNewPaymentAsync(booking, method, cancellationToken);
+            }
+
             return BadRequest(new { message = "This booking already has an active payment request." });
         }
 
-        if (method == PaymentMethodNames.Momo && booking.PaymentAttempts >= MaxPaymentAttempts)
-            return BadRequest(new { message = "Payment retry limit reached for this booking." });
-
-        var paymentCode = $"PAY-{DateTime.UtcNow:yyyyMMddHHmmssfff}";
-        var payment = new Payment
-        {
-            BookingId = booking.Id,
-            PaymentCode = paymentCode,
-            Method = method,
-            Amount = method == PaymentMethodNames.Momo
-                ? Convert.ToInt64(decimal.Round(booking.TotalAmount, 0, MidpointRounding.AwayFromZero))
-                : booking.TotalAmount,
-            Status = method == PaymentMethodNames.Momo
-                ? PaymentStatusNames.Pending
-                : PaymentStatusNames.AwaitingTransfer,
-            PaidAt = DateTime.UtcNow,
-            TransactionCode = method == PaymentMethodNames.Momo
-                ? BuildMomoOrderId(booking)
-                : $"BANK-{Guid.NewGuid().ToString("N")[..10].ToUpperInvariant()}"
-        };
-
-        MomoCreatePaymentResponse? momoResponse = null;
-
-        if (method == PaymentMethodNames.Momo)
-        {
-            booking.PaymentAttempts += 1;
-            var momoValidationError = ValidateMomoAmount(payment.Amount);
-            if (momoValidationError is not null)
-                return BadRequest(new { message = momoValidationError });
-
-            try
-            {
-                momoResponse = await CreateNewMomoPaymentAsync(booking, payment, cancellationToken);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to create MoMo sandbox payment for booking {BookingCode}", booking.BookingCode);
-                return StatusCode(502, new
-                {
-                    message = "Could not create the MoMo sandbox payment session. Please try again.",
-                    detail = ex.Message
-                });
-            }
-
-            booking.PaymentStatus = PaymentStatusNames.Pending;
-        }
-        else
-        {
-            booking.PaymentStatus = PaymentStatusNames.AwaitingTransfer;
-        }
-
-        booking.UpdatedAt = DateTime.UtcNow;
-
-        _db.Payments.Add(payment);
-        await _db.SaveChangesAsync(cancellationToken);
-
-        var response = MapPayment(payment, momoResponse, _momoOptions.UseSandbox);
-        await SendCreatedPaymentEmailAsync(booking, response, cancellationToken);
-
-        return CreatedAtAction(nameof(GetById), new { id = payment.Id }, response);
+        return await CreateNewPaymentAsync(booking, method, cancellationToken);
     }
 
     [Authorize(Roles = RoleNames.Customer)]
@@ -500,7 +452,7 @@ public class PaymentsController : ControllerBase
             ResetCheckIn(booking);
             booking.UpdatedAt = DateTime.UtcNow;
             await _db.SaveChangesAsync(cancellationToken);
-            return BadRequest(new { message = "The previous MoMo session expired. Please create a new payment request." });
+            return await CreateNewPaymentAsync(booking, PaymentMethodNames.Momo, cancellationToken);
         }
 
         try
@@ -521,6 +473,70 @@ public class PaymentsController : ControllerBase
                 detail = ex.Message
             });
         }
+    }
+
+    private async Task<ActionResult<PaymentDto>> CreateNewPaymentAsync(Booking booking, string method, CancellationToken cancellationToken)
+    {
+        if (method == PaymentMethodNames.Momo && booking.PaymentAttempts >= MaxPaymentAttempts)
+            return BadRequest(new { message = "Payment retry limit reached for this booking." });
+
+        var paymentCode = $"PAY-{DateTime.UtcNow:yyyyMMddHHmmssfff}";
+        var payment = new Payment
+        {
+            BookingId = booking.Id,
+            PaymentCode = paymentCode,
+            Method = method,
+            Amount = method == PaymentMethodNames.Momo
+                ? Convert.ToInt64(decimal.Round(booking.TotalAmount, 0, MidpointRounding.AwayFromZero))
+                : booking.TotalAmount,
+            Status = method == PaymentMethodNames.Momo
+                ? PaymentStatusNames.Pending
+                : PaymentStatusNames.AwaitingTransfer,
+            PaidAt = DateTime.UtcNow,
+            TransactionCode = method == PaymentMethodNames.Momo
+                ? BuildMomoOrderId(booking)
+                : $"BANK-{Guid.NewGuid().ToString("N")[..10].ToUpperInvariant()}"
+        };
+
+        MomoCreatePaymentResponse? momoResponse = null;
+
+        if (method == PaymentMethodNames.Momo)
+        {
+            booking.PaymentAttempts += 1;
+            var momoValidationError = ValidateMomoAmount(payment.Amount);
+            if (momoValidationError is not null)
+                return BadRequest(new { message = momoValidationError });
+
+            try
+            {
+                momoResponse = await CreateNewMomoPaymentAsync(booking, payment, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to create MoMo sandbox payment for booking {BookingCode}", booking.BookingCode);
+                return StatusCode(502, new
+                {
+                    message = "Could not create the MoMo sandbox payment session. Please try again.",
+                    detail = ex.Message
+                });
+            }
+
+            booking.PaymentStatus = PaymentStatusNames.Pending;
+        }
+        else
+        {
+            booking.PaymentStatus = PaymentStatusNames.AwaitingTransfer;
+        }
+
+        booking.UpdatedAt = DateTime.UtcNow;
+
+        _db.Payments.Add(payment);
+        await _db.SaveChangesAsync(cancellationToken);
+
+        var response = MapPayment(payment, momoResponse, _momoOptions.UseSandbox);
+        await SendCreatedPaymentEmailAsync(booking, response, cancellationToken);
+
+        return CreatedAtAction(nameof(GetById), new { id = payment.Id }, response);
     }
 
     private async Task<MomoCreatePaymentResponse> CreateNewMomoPaymentAsync(Booking booking, Payment payment, CancellationToken cancellationToken)
