@@ -22,4 +22,6 @@ public class PaymentDto
     public bool IsSandbox { get; set; }
     public bool CustomerCanConfirm { get; set; }
     public bool RequiresManualReview { get; set; }
+    public bool CanRefund { get; set; }
+    public string? RefundReason { get; set; }
 }

@@ -23,5 +23,8 @@ public class Payment
     [MaxLength(100)]
     public string? TransactionCode { get; set; }
 
+    [MaxLength(DataLengths.DESCRIPTION)]
+    public string? RefundReason { get; set; }
+
     public Booking? Booking { get; set; }
 }

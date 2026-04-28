@@ -330,10 +330,10 @@ public class BookingsController : ControllerBase
                 if (booking.IsCheckedIn)
                     return BadRequest(new { message = "Undo check-in before cancelling this booking." });
 
+                if (booking.PaymentStatus == PaymentStatusNames.Paid)
+                    return BadRequest(new { message = "Paid bookings must be refunded from the payments screen so a refund reason can be recorded." });
+
                 ResetCheckIn(booking);
-                booking.PaymentStatus = booking.PaymentStatus == PaymentStatusNames.Paid
-                    ? PaymentStatusNames.Refunded
-                    : booking.PaymentStatus;
                 break;
         }
 

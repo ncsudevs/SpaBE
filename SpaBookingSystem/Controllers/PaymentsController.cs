@@ -25,8 +25,7 @@ public class PaymentsController : ControllerBase
     [
         PaymentStatusNames.Pending,
         PaymentStatusNames.Paid,
-        PaymentStatusNames.Rejected,
-        PaymentStatusNames.Refunded
+        PaymentStatusNames.Rejected
     ];
 
     private static readonly TimeSpan PaymentTtl = TimeSpan.FromMinutes(5);
@@ -160,7 +159,19 @@ public class PaymentsController : ControllerBase
             if (latestActivePayment.Method == PaymentMethodNames.BankTransfer && method == PaymentMethodNames.BankTransfer)
                 return Ok(MapPayment(latestActivePayment));
 
-            return BadRequest(new { message = "This booking already has an active payment request." });
+            if (latestActivePayment.Method == PaymentMethodNames.Momo && method == PaymentMethodNames.BankTransfer)
+            {
+                latestActivePayment.Status = PaymentStatusNames.Rejected;
+                latestActivePayment.PaidAt = DateTime.UtcNow;
+                booking.PaymentStatus = PaymentStatusNames.Rejected;
+                booking.Status = BookingStatusNames.Pending;
+                ResetCheckIn(booking);
+                booking.UpdatedAt = DateTime.UtcNow;
+            }
+            else
+            {
+                return BadRequest(new { message = "This booking already has an active payment request." });
+            }
         }
 
         if (method == PaymentMethodNames.Momo && booking.PaymentAttempts >= MaxPaymentAttempts)
@@ -411,7 +422,7 @@ public class PaymentsController : ControllerBase
             return BadRequest(new { message = "Completed bookings cannot have their payment downgraded." });
 
         if (payment.Status == PaymentStatusNames.Paid && status == PaymentStatusNames.Rejected)
-            return BadRequest(new { message = "Use REFUNDED instead of REJECTED after payment is already confirmed." });
+            return BadRequest(new { message = "Use the refund action after payment is already confirmed." });
 
         payment.Status = status;
         payment.PaidAt = DateTime.UtcNow;
@@ -452,12 +463,40 @@ public class PaymentsController : ControllerBase
                         payment.Booking.BookingCode,
                         payment.PaymentCode));
                 break;
-
-            case PaymentStatusNames.Refunded:
-                payment.Booking.Status = BookingStatusNames.Cancelled;
-                ResetCheckIn(payment.Booking);
-                break;
         }
+
+        await _db.SaveChangesAsync();
+        return Ok(MapPayment(payment));
+    }
+
+    [Authorize(Roles = $"{RoleNames.Admin},{RoleNames.Cashier}")]
+    [HttpPost("{id:int}/refund")]
+    public async Task<ActionResult<PaymentDto>> Refund(int id, PaymentRefundDto dto)
+    {
+        var payment = await _db.Payments
+            .Include(x => x.Booking)
+            .FirstOrDefaultAsync(x => x.Id == id);
+
+        if (payment == null || payment.Booking == null)
+            return NotFound(new { message = "Payment not found" });
+
+        var reason = (dto.Reason ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(reason))
+            return BadRequest(new { message = "Refund reason is required." });
+
+        if (payment.Status != PaymentStatusNames.Paid)
+            return BadRequest(new { message = "Only paid payments can be refunded." });
+
+        if (!CanRefund(payment))
+            return BadRequest(new { message = "Only paid bookings that have not been checked in or completed can be refunded." });
+
+        payment.Status = PaymentStatusNames.Refunded;
+        payment.RefundReason = reason;
+        payment.PaidAt = DateTime.UtcNow;
+        payment.Booking.PaymentStatus = PaymentStatusNames.Refunded;
+        payment.Booking.Status = BookingStatusNames.Cancelled;
+        ResetCheckIn(payment.Booking);
+        payment.Booking.UpdatedAt = DateTime.UtcNow;
 
         await _db.SaveChangesAsync();
         return Ok(MapPayment(payment));
@@ -698,9 +737,18 @@ public class PaymentsController : ControllerBase
             CustomerCanConfirm = payment.Method == PaymentMethodNames.BankTransfer
                 && payment.Status == PaymentStatusNames.AwaitingTransfer,
             RequiresManualReview = payment.Method == PaymentMethodNames.BankTransfer
-                && payment.Status == PaymentStatusNames.Pending
+                && payment.Status == PaymentStatusNames.Pending,
+            CanRefund = CanRefund(payment),
+            RefundReason = payment.RefundReason
         };
     }
+
+    private static bool CanRefund(Payment payment) =>
+        payment.Booking != null
+        && payment.Status == PaymentStatusNames.Paid
+        && payment.Booking.Status != BookingStatusNames.Completed
+        && payment.Booking.Status != BookingStatusNames.Cancelled
+        && !payment.Booking.IsCheckedIn;
 
     private string? ValidateMomoAmount(decimal amount)
     {

@@ -317,6 +317,9 @@ public class SpaDbContext : DbContext
             e.Property(x => x.TransactionCode).HasColumnName("transaction_code")
                 .HasMaxLength(100);
 
+            e.Property(x => x.RefundReason).HasColumnName("refund_reason")
+                .HasMaxLength(DataLengths.DESCRIPTION);
+
             e.HasOne(x => x.Booking)
                 .WithMany(x => x.Payments)
                 .HasForeignKey(x => x.BookingId)
