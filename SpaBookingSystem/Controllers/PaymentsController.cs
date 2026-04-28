@@ -166,7 +166,7 @@ public class PaymentsController : ControllerBase
         if (method == PaymentMethodNames.Momo && booking.PaymentAttempts >= MaxPaymentAttempts)
             return BadRequest(new { message = "Payment retry limit reached for this booking." });
 
-        var paymentCode = $"PAY-{DateTime.UtcNow:yyyyMMddHHmmss}";
+        var paymentCode = $"PAY-{DateTime.UtcNow:yyyyMMddHHmmssfff}";
         var payment = new Payment
         {
             BookingId = booking.Id,
@@ -253,6 +253,7 @@ public class PaymentsController : ControllerBase
         payment.PaidAt = DateTime.UtcNow;
         payment.Booking.PaymentStatus = PaymentStatusNames.Pending;
         payment.Booking.Status = BookingStatusNames.Pending;
+        ResetCheckIn(payment.Booking);
         payment.Booking.UpdatedAt = DateTime.UtcNow;
 
         await _db.SaveChangesAsync(cancellationToken);
@@ -345,6 +346,7 @@ public class PaymentsController : ControllerBase
             payment.Status = PaymentStatusNames.Rejected;
             payment.Booking.PaymentStatus = PaymentStatusNames.Rejected;
             payment.Booking.Status = BookingStatusNames.Pending;
+            ResetCheckIn(payment.Booking);
             payment.Booking.UpdatedAt = DateTime.UtcNow;
             await _db.SaveChangesAsync(cancellationToken);
             _logger.LogInformation("Ignored MoMo IPN because session expired for order {OrderId}", request.OrderId);
@@ -440,6 +442,7 @@ public class PaymentsController : ControllerBase
 
             case PaymentStatusNames.Rejected:
                 payment.Booking.Status = BookingStatusNames.Pending;
+                ResetCheckIn(payment.Booking);
 
                 await _emailSender.SendAsync(
                     payment.Booking.Email,
@@ -452,6 +455,7 @@ public class PaymentsController : ControllerBase
 
             case PaymentStatusNames.Refunded:
                 payment.Booking.Status = BookingStatusNames.Cancelled;
+                ResetCheckIn(payment.Booking);
                 break;
         }
 
@@ -475,6 +479,7 @@ public class PaymentsController : ControllerBase
             payment.Booking.PaymentStatus = PaymentStatusNames.Unpaid;
             if (payment.Booking.Status == BookingStatusNames.Confirmed)
                 payment.Booking.Status = BookingStatusNames.Pending;
+            ResetCheckIn(payment.Booking);
 
             payment.Booking.UpdatedAt = DateTime.UtcNow;
         }
@@ -492,6 +497,7 @@ public class PaymentsController : ControllerBase
             existingPending.Status = PaymentStatusNames.Rejected;
             booking.PaymentStatus = PaymentStatusNames.Rejected;
             booking.Status = BookingStatusNames.Pending;
+            ResetCheckIn(booking);
             booking.UpdatedAt = DateTime.UtcNow;
             await _db.SaveChangesAsync(cancellationToken);
             return BadRequest(new { message = "The previous MoMo session expired. Please create a new payment request." });
@@ -849,6 +855,7 @@ public class PaymentsController : ControllerBase
         payment.Status = PaymentStatusNames.Rejected;
         payment.Booking.PaymentStatus = PaymentStatusNames.Rejected;
         payment.Booking.Status = bookingStatus;
+        ResetCheckIn(payment.Booking);
         payment.Booking.UpdatedAt = DateTime.UtcNow;
 
         await _emailSender.SendAsync(
@@ -891,6 +898,12 @@ public class PaymentsController : ControllerBase
     {
         if (value.Kind == DateTimeKind.Utc) return value;
         return DateTime.SpecifyKind(value, DateTimeKind.Utc);
+    }
+
+    private static void ResetCheckIn(Booking booking)
+    {
+        booking.IsCheckedIn = false;
+        booking.CheckedInAt = null;
     }
 
     private static DateTime GetBangkokNow()

@@ -159,33 +159,8 @@ public sealed class BookingStaffingService : IBookingStaffingService
             };
         }
 
-        var scheduledAssignments = await _db.BookingDetailStaffAssignments
-            .AsNoTracking()
-            .Include(x => x.BookingDetail)
-                .ThenInclude(x => x!.Booking)
-            .Include(x => x.BookingDetail)
-                .ThenInclude(x => x!.Service)
-            .Where(x => x.BookingDetail != null
-                && appointmentDates.Contains(x.BookingDetail.AppointmentDate)
-                && x.BookingDetail.Booking != null
-                && x.BookingDetail.Booking.Status != BookingStatusNames.Cancelled)
-            .ToListAsync(cancellationToken);
-
-        var loads = scheduledAssignments
-            .Where(x => x.BookingDetail?.Service != null)
-            .Select(x => new PlannedAssignmentLoad
-            {
-                AssignmentId = x.Id,
-                BookingDetailId = x.BookingDetailId,
-                StaffId = x.StaffId,
-                AppointmentDate = x.BookingDetail!.AppointmentDate,
-                AppointmentTime = x.BookingDetail.AppointmentTime ?? string.Empty,
-                Duration = x.BookingDetail.Service!.Duration,
-                AssignedQuantity = x.AssignedQuantity,
-            })
-            .ToList();
-
         var warnings = new List<string>();
+        var plannedLoads = new List<PlannedAssignmentLoad>();
 
         foreach (var detail in details)
         {
@@ -200,18 +175,32 @@ public sealed class BookingStaffingService : IBookingStaffingService
 
             while (remaining > 0)
             {
-                var nextCandidate = candidates
-                    .Select(staff => new
+                var staffCapacities = new List<(Staff Staff, int RemainingCapacity)>();
+
+                foreach (var staff in candidates)
+                {
+                    var persistedRemaining = await GetRemainingCapacityAsync(
+                        staff,
+                        detail.AppointmentDate,
+                        detail.AppointmentTime ?? string.Empty,
+                        detail.Service.Duration,
+                        cancellationToken: cancellationToken);
+
+                    var plannedUsage = GetPlannedUsage(plannedLoads, staff, detail);
+                    var effectiveRemaining = Math.Max(0, persistedRemaining - plannedUsage);
+
+                    if (effectiveRemaining > 0)
                     {
-                        Staff = staff,
-                        RemainingCapacity = GetRemainingCapacityFromLoads(loads, staff, detail)
-                    })
-                    .Where(x => x.RemainingCapacity > 0)
+                        staffCapacities.Add((staff, effectiveRemaining));
+                    }
+                }
+
+                var nextCandidate = staffCapacities
                     .OrderByDescending(x => x.RemainingCapacity)
                     .ThenBy(x => x.Staff.Id)
                     .FirstOrDefault();
 
-                if (nextCandidate == null)
+                if (nextCandidate.Staff == null || nextCandidate.RemainingCapacity <= 0)
                     break;
 
                 var assignedQuantity = Math.Min(remaining, nextCandidate.RemainingCapacity);
@@ -238,7 +227,14 @@ public sealed class BookingStaffingService : IBookingStaffingService
                     existingAssignment.AssignedQuantity += assignedQuantity;
                 }
 
-                UpsertLoad(loads, detail, nextCandidate.Staff.Id, assignedQuantity, existingAssignment.Id);
+                plannedLoads.Add(new PlannedAssignmentLoad
+                {
+                    StaffId = nextCandidate.Staff.Id,
+                    AppointmentDate = detail.AppointmentDate,
+                    AppointmentTime = detail.AppointmentTime ?? string.Empty,
+                    Duration = detail.Service.Duration,
+                    AssignedQuantity = assignedQuantity,
+                });
                 remaining -= assignedQuantity;
             }
 
@@ -261,8 +257,8 @@ public sealed class BookingStaffingService : IBookingStaffingService
         };
     }
 
-    private static int GetRemainingCapacityFromLoads(
-        List<PlannedAssignmentLoad> loads,
+    private static int GetPlannedUsage(
+        List<PlannedAssignmentLoad> plannedLoads,
         Staff staff,
         BookingDetail detail)
     {
@@ -273,7 +269,7 @@ public sealed class BookingStaffingService : IBookingStaffingService
         var targetEnd = start.Value + Math.Max(1, detail.Service?.Duration ?? 1);
         var usedCapacity = 0;
 
-        foreach (var load in loads)
+        foreach (var load in plannedLoads)
         {
             if (load.StaffId != staff.Id || load.AppointmentDate != detail.AppointmentDate)
                 continue;
@@ -291,37 +287,7 @@ public sealed class BookingStaffingService : IBookingStaffingService
             }
         }
 
-        return Math.Max(0, staff.MaxConcurrent - usedCapacity);
-    }
-
-    private static void UpsertLoad(
-        List<PlannedAssignmentLoad> loads,
-        BookingDetail detail,
-        int staffId,
-        int assignedQuantity,
-        int assignmentId)
-    {
-        var existing = loads.FirstOrDefault(x =>
-            x.BookingDetailId == detail.Id &&
-            x.StaffId == staffId &&
-            x.AssignmentId == assignmentId);
-
-        if (existing == null)
-        {
-            loads.Add(new PlannedAssignmentLoad
-            {
-                AssignmentId = assignmentId,
-                BookingDetailId = detail.Id,
-                StaffId = staffId,
-                AppointmentDate = detail.AppointmentDate,
-                AppointmentTime = detail.AppointmentTime ?? string.Empty,
-                Duration = detail.Service?.Duration ?? 1,
-                AssignedQuantity = assignedQuantity,
-            });
-            return;
-        }
-
-        existing.AssignedQuantity += assignedQuantity;
+        return usedCapacity;
     }
 
     private static string BuildDetailWarning(BookingDetail detail, int remainingQuantity)
@@ -351,8 +317,6 @@ public sealed class BookingStaffingService : IBookingStaffingService
 
     private sealed class PlannedAssignmentLoad
     {
-        public int AssignmentId { get; set; }
-        public int BookingDetailId { get; set; }
         public int StaffId { get; set; }
         public DateOnly AppointmentDate { get; set; }
         public string AppointmentTime { get; set; } = string.Empty;

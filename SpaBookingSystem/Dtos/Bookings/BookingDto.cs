@@ -12,6 +12,8 @@ public class BookingDto
     public string? Note { get; set; }
     public decimal TotalAmount { get; set; }
     public string Status { get; set; } = string.Empty;
+    public string WorkflowStatus { get; set; } = string.Empty;
+    public string WorkflowStatusLabel { get; set; } = string.Empty;
     public string PaymentStatus { get; set; } = string.Empty;
     public bool IsGroupBooking { get; set; }
     public int GroupSize { get; set; }

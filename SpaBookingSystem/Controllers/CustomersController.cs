@@ -4,6 +4,7 @@ using Microsoft.EntityFrameworkCore;
 using SpaBookingSystem.Api.Dtos.Bookings;
 using SpaBookingSystem.Api.Dtos.Customers;
 using SpaBookingSystem.Api.Dtos.Payments;
+using SpaBookingSystem.ApplicationCore.Constants;
 using SpaBookingSystem.DataLayer;
 using SpaBookingSystem.ApplicationCore.Entities;
 using SpaBookingSystem.Api.Helpers;
@@ -28,9 +29,33 @@ public class CustomersController : ControllerBase
     [HttpGet]
     public async Task<ActionResult<List<CustomerDto>>> GetAll()
     {
-        var data = await _db.Customers
+        var customers = await _db.Customers
             .AsNoTracking()
-            .Select(c => new CustomerDto
+            .OrderBy(c => c.FullName)
+            .ToListAsync();
+
+        var normalizedEmails = customers
+            .Select(c => c.Email.Trim().ToLowerInvariant())
+            .Distinct()
+            .ToList();
+
+        var bookings = await _db.Bookings
+            .AsNoTracking()
+            .Where(b => normalizedEmails.Contains(b.Email.ToLower()))
+            .ToListAsync();
+
+        var bookingsByEmail = bookings
+            .GroupBy(b => b.Email.Trim().ToLowerInvariant())
+            .ToDictionary(g => g.Key, g => g.ToList());
+
+        var data = customers.Select(c =>
+        {
+            var emailKey = c.Email.Trim().ToLowerInvariant();
+            bookingsByEmail.TryGetValue(emailKey, out var customerBookings);
+            customerBookings ??= new List<Booking>();
+            var deleteBlockedReason = GetCustomerDeleteBlockedReason(customerBookings);
+
+            return new CustomerDto
             {
                 Id = c.Id,
                 FullName = c.FullName,
@@ -39,10 +64,11 @@ public class CustomersController : ControllerBase
                 IsActive = c.IsActive,
                 CreatedAt = c.CreatedAt,
                 UpdatedAt = c.UpdatedAt,
-                BookingCount = _db.Bookings.Count(b => b.Email.ToLower() == c.Email.ToLower())
-            })
-            .OrderBy(c => c.FullName)
-            .ToListAsync();
+                BookingCount = customerBookings.Count,
+                CanDelete = deleteBlockedReason == null,
+                DeleteBlockedReason = deleteBlockedReason
+            };
+        }).ToList();
 
         return Ok(data);
     }
@@ -83,6 +109,8 @@ public class CustomersController : ControllerBase
             IsActive = customer.IsActive,
             CreatedAt = customer.CreatedAt,
             UpdatedAt = customer.UpdatedAt,
+            CanDelete = GetCustomerDeleteBlockedReason(bookings) == null,
+            DeleteBlockedReason = GetCustomerDeleteBlockedReason(bookings),
             Bookings = bookings.Select(MapBooking).ToList(),
             Payments = payments.Select(MapPayment).ToList()
         };
@@ -97,9 +125,14 @@ public class CustomersController : ControllerBase
         var customer = await _db.Customers.FirstOrDefaultAsync(x => x.Id == id);
         if (customer == null) return NotFound(new { message = "Customer not found" });
 
-        var hasBookings = await _db.Bookings.AnyAsync(b => b.Email.ToLower() == customer.Email.ToLower());
-        if (hasBookings)
-            return Conflict(new { message = "Cannot delete: customer has bookings." });
+        var bookings = await _db.Bookings
+            .AsNoTracking()
+            .Where(b => b.Email.ToLower() == customer.Email.ToLower())
+            .ToListAsync();
+
+        var deleteBlockedReason = GetCustomerDeleteBlockedReason(bookings);
+        if (deleteBlockedReason != null)
+            return Conflict(new { message = deleteBlockedReason });
 
         _db.Customers.Remove(customer);
         await _db.SaveChangesAsync();
@@ -141,6 +174,7 @@ public class CustomersController : ControllerBase
     }
     private BookingDto MapBooking(Booking booking)
     {
+        var effectiveCheckedIn = IsEffectiveCheckedIn(booking);
         var firstSlot = booking.BookingDetails.OrderBy(x => x.AppointmentDate).ThenBy(x => x.AppointmentTime).FirstOrDefault();
         var latestPayment = booking.Payments?
             .OrderByDescending(p => p.PaidAt)
@@ -159,6 +193,8 @@ public class CustomersController : ControllerBase
             Note = booking.Note,
             TotalAmount = booking.TotalAmount,
             Status = booking.Status,
+            WorkflowStatus = GetWorkflowStatus(booking),
+            WorkflowStatusLabel = GetWorkflowStatusLabel(booking),
             PaymentStatus = booking.PaymentStatus,
             IsGroupBooking = booking.IsGroupBooking,
             GroupSize = booking.GroupSize,
@@ -168,8 +204,8 @@ public class CustomersController : ControllerBase
             LastPaymentCreatedAt = latestPayment?.PaidAt,
             LatestPaymentId = latestPayment?.Id,
             LatestPaymentMethod = latestPayment?.Method,
-            IsCheckedIn = booking.IsCheckedIn,
-            CheckedInAt = booking.CheckedInAt,
+            IsCheckedIn = effectiveCheckedIn,
+            CheckedInAt = effectiveCheckedIn ? booking.CheckedInAt : null,
             IsFullyStaffed = _bookingStaffingService.IsFullyStaffed(booking),
             StaffingWarning = _bookingStaffingService.BuildBookingStaffingWarning(booking),
             Items = booking.BookingDetails.OrderBy(x => x.AppointmentDate).ThenBy(x => x.AppointmentTime).Select(d => new BookingItemDto
@@ -229,4 +265,52 @@ public class CustomersController : ControllerBase
             IsSandbox = false
         };
     }
+
+    private static string? GetCustomerDeleteBlockedReason(IEnumerable<Booking> bookings)
+    {
+        var bookingList = bookings.ToList();
+        if (bookingList.Count == 0)
+            return null;
+
+        if (bookingList.Any(b => IsEffectiveCheckedIn(b) || b.Status == BookingStatusNames.Completed))
+            return "Cannot delete this customer because at least one booking is already checked in or completed.";
+
+        if (bookingList.Any(b => b.PaymentStatus is PaymentStatusNames.AwaitingTransfer or PaymentStatusNames.Pending or PaymentStatusNames.Paid))
+            return "Cannot delete this customer while a booking still has an active or paid payment.";
+
+        if (bookingList.Any(b => b.Status is BookingStatusNames.Pending or BookingStatusNames.Confirmed))
+            return "Cannot delete this customer while a booking is still waiting or scheduled.";
+
+        return null;
+    }
+
+    private static string GetWorkflowStatus(Booking booking)
+    {
+        if (booking.Status == BookingStatusNames.Cancelled)
+            return BookingStatusNames.Cancelled;
+
+        if (booking.Status == BookingStatusNames.Completed)
+            return BookingStatusNames.Completed;
+
+        if (IsEffectiveCheckedIn(booking))
+            return "CHECKED_IN";
+
+        return booking.Status;
+    }
+
+    private static bool IsEffectiveCheckedIn(Booking booking) =>
+        booking.IsCheckedIn
+        && booking.Status == BookingStatusNames.Confirmed
+        && booking.PaymentStatus == PaymentStatusNames.Paid;
+
+    private static string GetWorkflowStatusLabel(Booking booking) =>
+        GetWorkflowStatus(booking) switch
+        {
+            "CHECKED_IN" => "Checked in",
+            BookingStatusNames.Pending => "Waiting processing",
+            BookingStatusNames.Confirmed => "Paid and scheduled",
+            BookingStatusNames.Completed => "Service completed",
+            BookingStatusNames.Cancelled => "Cancelled",
+            var other => other
+        };
 }

@@ -12,6 +12,8 @@ public class CustomerDetailDto
     public bool IsActive { get; set; }
     public DateTime CreatedAt { get; set; }
     public DateTime UpdatedAt { get; set; }
+    public bool CanDelete { get; set; }
+    public string? DeleteBlockedReason { get; set; }
 
     public List<BookingDto> Bookings { get; set; } = new();
     public List<PaymentDto> Payments { get; set; } = new();

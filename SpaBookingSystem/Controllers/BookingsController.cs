@@ -222,7 +222,7 @@ public class BookingsController : ControllerBase
 
         var booking = new Booking
         {
-            BookingCode = $"BK-{DateTime.UtcNow:yyyyMMddHHmmss}",
+            BookingCode = $"BK-{DateTime.UtcNow:yyyyMMddHHmmssfff}",
             FullName = customer.FullName,
             Phone = customer.Phone ?? string.Empty,
             Email = customer.Email,
@@ -289,35 +289,56 @@ public class BookingsController : ControllerBase
         if (booking == null)
             return NotFound(new { message = "Booking not found" });
 
-        if (status == BookingStatusNames.Confirmed && booking.PaymentStatus != PaymentStatusNames.Paid)
-            return BadRequest(new { message = "Only paid bookings can be confirmed." });
+        if (booking.Status == BookingStatusNames.Cancelled && status != BookingStatusNames.Cancelled)
+            return BadRequest(new { message = "Cancelled bookings are final and cannot be reopened." });
 
-        if (status == BookingStatusNames.Completed)
+        switch (status)
         {
-            if (booking.PaymentStatus != PaymentStatusNames.Paid)
-                return BadRequest(new { message = "Check-in can only be completed after payment is confirmed." });
+            case BookingStatusNames.Pending:
+                if (booking.PaymentStatus == PaymentStatusNames.Paid)
+                    return BadRequest(new { message = "Paid bookings cannot be moved back to PENDING." });
 
-            if (booking.Status != BookingStatusNames.Confirmed && booking.Status != BookingStatusNames.Completed)
-                return BadRequest(new { message = "Booking must be confirmed before it can be completed." });
+                ResetCheckIn(booking);
+                break;
 
-            if (!booking.IsCheckedIn)
-                return BadRequest(new { message = "Booking must be checked in before it can be completed." });
+            case BookingStatusNames.Confirmed:
+                if (booking.PaymentStatus != PaymentStatusNames.Paid)
+                    return BadRequest(new { message = "Only paid bookings can be confirmed." });
 
-            if (!_bookingStaffingService.IsFullyStaffed(booking))
-                return BadRequest(new { message = "Assign enough staff quantity to every booking item before completing check-in." });
+                if (booking.Status == BookingStatusNames.Completed)
+                    return BadRequest(new { message = "Completed bookings cannot be moved back to CONFIRMED." });
+                break;
+
+            case BookingStatusNames.Completed:
+                if (booking.PaymentStatus != PaymentStatusNames.Paid)
+                    return BadRequest(new { message = "Check-in can only be completed after payment is confirmed." });
+
+                if (booking.Status != BookingStatusNames.Confirmed && booking.Status != BookingStatusNames.Completed)
+                    return BadRequest(new { message = "Booking must be confirmed before it can be completed." });
+
+                if (!booking.IsCheckedIn)
+                    return BadRequest(new { message = "Booking must be checked in before it can be completed." });
+
+                if (!_bookingStaffingService.IsFullyStaffed(booking))
+                    return BadRequest(new { message = "Assign enough staff quantity to every booking item before completing check-in." });
+                break;
+
+            case BookingStatusNames.Cancelled:
+                if (booking.Status == BookingStatusNames.Completed)
+                    return BadRequest(new { message = "Completed bookings cannot be cancelled." });
+
+                if (booking.IsCheckedIn)
+                    return BadRequest(new { message = "Undo check-in before cancelling this booking." });
+
+                ResetCheckIn(booking);
+                booking.PaymentStatus = booking.PaymentStatus == PaymentStatusNames.Paid
+                    ? PaymentStatusNames.Refunded
+                    : booking.PaymentStatus;
+                break;
         }
-
-        if (status == BookingStatusNames.Pending && booking.PaymentStatus == PaymentStatusNames.Paid)
-            return BadRequest(new { message = "Paid bookings cannot be moved back to PENDING." });
-
-        if (status == BookingStatusNames.Cancelled && booking.Status == BookingStatusNames.Completed)
-            return BadRequest(new { message = "Completed bookings cannot be cancelled." });
 
         booking.Status = status;
         booking.UpdatedAt = DateTime.UtcNow;
-
-        if (status == BookingStatusNames.Cancelled)
-            booking.PaymentStatus = booking.PaymentStatus == PaymentStatusNames.Paid ? PaymentStatusNames.Refunded : booking.PaymentStatus;
 
         await _db.SaveChangesAsync();
         return Ok(MapBooking(booking));
@@ -343,8 +364,18 @@ public class BookingsController : ControllerBase
         if (booking.PaymentStatus != PaymentStatusNames.Paid)
             return Conflict(new { message = "Only paid bookings can be checked in." });
 
-        if (booking.Status == BookingStatusNames.Completed && !dto.IsCheckedIn)
+        if (booking.Status == BookingStatusNames.Cancelled)
+            return Conflict(new { message = "Cancelled bookings cannot be checked in." });
+
+        if (dto.IsCheckedIn)
+        {
+            if (booking.Status != BookingStatusNames.Confirmed)
+                return Conflict(new { message = "Only confirmed bookings can be checked in." });
+        }
+        else if (booking.Status == BookingStatusNames.Completed)
+        {
             return Conflict(new { message = "Completed bookings cannot be unchecked." });
+        }
 
         booking.IsCheckedIn = dto.IsCheckedIn;
         booking.CheckedInAt = dto.IsCheckedIn ? DateTime.UtcNow : null;
@@ -600,6 +631,7 @@ public class BookingsController : ControllerBase
 
     private BookingDto MapBooking(Booking booking)
     {
+        var effectiveCheckedIn = IsEffectiveCheckedIn(booking);
         var firstSlot = booking.BookingDetails.OrderBy(x => x.AppointmentDate).ThenBy(x => x.AppointmentTime).FirstOrDefault();
         var latestPayment = booking.Payments?
             .OrderByDescending(p => p.PaidAt)
@@ -618,6 +650,8 @@ public class BookingsController : ControllerBase
             Note = booking.Note,
             TotalAmount = booking.TotalAmount,
             Status = booking.Status,
+            WorkflowStatus = GetWorkflowStatus(booking),
+            WorkflowStatusLabel = GetWorkflowStatusLabel(booking),
             PaymentStatus = booking.PaymentStatus,
             IsGroupBooking = booking.IsGroupBooking,
             GroupSize = booking.GroupSize,
@@ -627,8 +661,8 @@ public class BookingsController : ControllerBase
             LastPaymentCreatedAt = latestPayment != null ? ToUtc(latestPayment.PaidAt) : null,
             LatestPaymentId = latestPayment?.Id,
             LatestPaymentMethod = latestPayment?.Method,
-            IsCheckedIn = booking.IsCheckedIn,
-            CheckedInAt = booking.CheckedInAt != null ? ToUtc(booking.CheckedInAt.Value) : null,
+            IsCheckedIn = effectiveCheckedIn,
+            CheckedInAt = effectiveCheckedIn && booking.CheckedInAt != null ? ToUtc(booking.CheckedInAt.Value) : null,
             IsFullyStaffed = _bookingStaffingService.IsFullyStaffed(booking),
             StaffingWarning = _bookingStaffingService.BuildBookingStaffingWarning(booking),
             Items = booking.BookingDetails.OrderBy(x => x.AppointmentDate).ThenBy(x => x.AppointmentTime).Select(d => new BookingItemDto
@@ -670,6 +704,42 @@ public class BookingsController : ControllerBase
         if (value.Kind == DateTimeKind.Utc) return value;
         return DateTime.SpecifyKind(value, DateTimeKind.Utc);
     }
+
+    private static void ResetCheckIn(Booking booking)
+    {
+        booking.IsCheckedIn = false;
+        booking.CheckedInAt = null;
+    }
+
+    private static string GetWorkflowStatus(Booking booking)
+    {
+        if (booking.Status == BookingStatusNames.Cancelled)
+            return BookingStatusNames.Cancelled;
+
+        if (booking.Status == BookingStatusNames.Completed)
+            return BookingStatusNames.Completed;
+
+        if (IsEffectiveCheckedIn(booking))
+            return "CHECKED_IN";
+
+        return booking.Status;
+    }
+
+    private static bool IsEffectiveCheckedIn(Booking booking) =>
+        booking.IsCheckedIn
+        && booking.Status == BookingStatusNames.Confirmed
+        && booking.PaymentStatus == PaymentStatusNames.Paid;
+
+    private static string GetWorkflowStatusLabel(Booking booking) =>
+        GetWorkflowStatus(booking) switch
+        {
+            "CHECKED_IN" => "Checked in",
+            BookingStatusNames.Pending => "Waiting processing",
+            BookingStatusNames.Confirmed => "Paid and scheduled",
+            BookingStatusNames.Completed => "Service completed",
+            BookingStatusNames.Cancelled => "Cancelled",
+            var other => other
+        };
 
     private static DateTime GetBangkokNow()
     {
