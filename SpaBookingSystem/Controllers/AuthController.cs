@@ -10,6 +10,7 @@ using SpaBookingSystem.DataLayer;
 using System.Security.Claims;
 using SpaBookingSystem.Api.Helpers;
 using SpaBookingSystem.Api.Services.Email;
+using SpaBookingSystem.ApplicationCore.Constants;
 
 namespace SpaBookingSystem.Api.Controllers;
 
@@ -172,7 +173,7 @@ public class AuthController : ControllerBase
         if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(role))
             return Unauthorized(new { message = "Invalid token" });
 
-        if (role == "ADMIN")
+        if (role == RoleNames.Admin || role == RoleNames.Cashier)
         {
             var admin = await _db.Admins.AsNoTracking().FirstOrDefaultAsync(x => x.Email.ToLower() == email);
             if (admin == null) return Unauthorized(new { message = "Account not found" });

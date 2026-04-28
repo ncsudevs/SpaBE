@@ -8,12 +8,11 @@ public class BookingDetail
     public int Quantity { get; set; }
     public DateOnly AppointmentDate { get; set; }
     public string? AppointmentTime { get; set; } = string.Empty;
-    public int? StaffId { get; set; }
 
     public decimal UnitPrice { get; set; }
     public decimal LineTotal { get; set; }
 
     public Booking? Booking { get; set; }
     public Service? Service { get; set; }
-    public Staff? Staff { get; set; }
+    public List<BookingDetailStaffAssignment> StaffAssignments { get; set; } = new();
 }

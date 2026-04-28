@@ -12,6 +12,8 @@ public class BookingDto
     public string? Note { get; set; }
     public decimal TotalAmount { get; set; }
     public string Status { get; set; } = string.Empty;
+    public string WorkflowStatus { get; set; } = string.Empty;
+    public string WorkflowStatusLabel { get; set; } = string.Empty;
     public string PaymentStatus { get; set; } = string.Empty;
     public bool IsGroupBooking { get; set; }
     public int GroupSize { get; set; }
@@ -19,5 +21,11 @@ public class BookingDto
     public DateTime UpdatedAt { get; set; }
     public int PaymentAttempts { get; set; }
     public DateTime? LastPaymentCreatedAt { get; set; }
+    public int? LatestPaymentId { get; set; }
+    public string? LatestPaymentMethod { get; set; }
+    public bool IsCheckedIn { get; set; }
+    public DateTime? CheckedInAt { get; set; }
+    public bool IsFullyStaffed { get; set; }
+    public string? StaffingWarning { get; set; }
     public List<BookingItemDto> Items { get; set; } = new();
 }

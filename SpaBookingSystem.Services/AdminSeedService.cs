@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.EntityFrameworkCore;
+using SpaBookingSystem.ApplicationCore.Constants;
 using SpaBookingSystem.ApplicationCore.Entities;
 using SpaBookingSystem.DataLayer;
 
@@ -20,8 +21,14 @@ public class AdminSeedService : IAdminSeedService
 
     public async Task SeedAsync()
     {
-        var seedSection = _configuration.GetSection("DefaultAdmin");
-        var email = seedSection["Email"]?.Trim().ToLower();
+        await SeedAccountAsync("DefaultAdmin", RoleNames.Admin);
+        await SeedAccountAsync("DefaultCashier", RoleNames.Cashier);
+    }
+
+    private async Task SeedAccountAsync(string sectionName, string role)
+    {
+        var seedSection = _configuration.GetSection(sectionName);
+        var email = seedSection["Email"]?.Trim().ToLowerInvariant();
         var password = seedSection["Password"]?.Trim();
         var fullName = seedSection["FullName"]?.Trim();
 
@@ -36,7 +43,7 @@ public class AdminSeedService : IAdminSeedService
             FullName = fullName,
             Email = email,
             PasswordHash = _passwordService.Hash(password),
-            Role = "ADMIN",
+            Role = role,
             IsActive = true,
             CreatedAt = DateTime.UtcNow,
             UpdatedAt = DateTime.UtcNow

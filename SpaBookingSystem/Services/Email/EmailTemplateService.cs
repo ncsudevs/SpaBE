@@ -27,6 +27,48 @@ public static class EmailTemplateService
 <p>Your order is waiting for admin confirmation.</p>";
     }
 
+    public static string BuildBankTransferInstructionTemplate(string fullName, string bookingCode, string paymentCode, string providerName, string accountNumber, string accountName, decimal amount, string content, string instruction)
+    {
+        return $@"
+<h2>Bank transfer instruction</h2>
+<p>Hello <strong>{fullName}</strong>,</p>
+<p>Your payment request for booking <strong>{bookingCode}</strong> has been created.</p>
+<ul>
+  <li>Payment code: <strong>{paymentCode}</strong></li>
+  <li>Bank: <strong>{providerName}</strong></li>
+  <li>Account number: <strong>{accountNumber}</strong></li>
+  <li>Account name: <strong>{accountName}</strong></li>
+  <li>Amount: <strong>{amount:N0}</strong></li>
+  <li>Transfer content: <strong>{content}</strong></li>
+</ul>
+<p>{instruction}</p>";
+    }
+
+    public static string BuildCashierPaymentSubmittedTemplate(string bookingCode, string paymentCode, string customerName, decimal amount, string content)
+    {
+        return $@"
+<h2>Customer submitted bank transfer</h2>
+<p>A customer has confirmed a bank transfer and is waiting for cashier review.</p>
+<ul>
+  <li>Booking code: <strong>{bookingCode}</strong></li>
+  <li>Payment code: <strong>{paymentCode}</strong></li>
+  <li>Customer: <strong>{customerName}</strong></li>
+  <li>Amount: <strong>{amount:N0}</strong></li>
+  <li>Transfer content: <strong>{content}</strong></li>
+</ul>
+<p>Please review the incoming transfer and update the payment status.</p>";
+    }
+
+    public static string BuildBankTransferSubmittedTemplate(string fullName, string bookingCode, string paymentCode)
+    {
+        return $@"
+<h2>Transfer confirmation received</h2>
+<p>Hello <strong>{fullName}</strong>,</p>
+<p>We have received your transfer confirmation for booking <strong>{bookingCode}</strong>.</p>
+<p>Payment code: <strong>{paymentCode}</strong></p>
+<p>The cashier will review the transfer and update your booking once it is verified.</p>";
+    }
+
     public static string BuildPaymentConfirmedTemplate(string fullName, string bookingCode, string paymentCode)
     {
         return $@"

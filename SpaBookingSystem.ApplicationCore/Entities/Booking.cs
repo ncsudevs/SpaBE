@@ -38,6 +38,8 @@ public class Booking
 
     public bool IsGroupBooking { get; set; }
     public int GroupSize { get; set; } = 1;
+    public bool IsCheckedIn { get; set; }
+    public DateTime? CheckedInAt { get; set; }
 
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;

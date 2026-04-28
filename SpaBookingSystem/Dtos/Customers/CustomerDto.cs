@@ -10,4 +10,6 @@ public class CustomerDto
     public DateTime CreatedAt { get; set; }
     public DateTime UpdatedAt { get; set; }
     public int BookingCount { get; set; }
+    public bool CanDelete { get; set; }
+    public string? DeleteBlockedReason { get; set; }
 }

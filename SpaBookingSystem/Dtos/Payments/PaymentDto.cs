@@ -20,4 +20,6 @@ public class PaymentDto
     public string? DeepLink { get; set; }
     public string? QrCodeUrl { get; set; }
     public bool IsSandbox { get; set; }
+    public bool CustomerCanConfirm { get; set; }
+    public bool RequiresManualReview { get; set; }
 }

@@ -9,6 +9,7 @@ using SpaBookingSystem.Api.Options;
 using SpaBookingSystem.Api.Services.Email;
 using SpaBookingSystem.Api.Services.Momo;
 using System.Text;
+using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -18,9 +19,33 @@ builder.Services.AddDbContext<SpaDbContext>(options =>
 builder.Services.AddScoped<IPasswordService, PasswordService>();
 builder.Services.AddScoped<ITokenService, TokenService>();
 builder.Services.AddScoped<IAdminSeedService, AdminSeedService>();
+builder.Services.AddScoped<IBookingStaffingService, BookingStaffingService>();
 builder.Services.Configure<EmailOptions>(builder.Configuration.GetSection(EmailOptions.SectionName));
 builder.Services.Configure<MomoOptions>(builder.Configuration.GetSection(MomoOptions.SectionName));
-builder.Services.AddScoped<IEmailSender, FileEmailSender>();
+builder.Services.Configure<BankTransferOptions>(builder.Configuration.GetSection(BankTransferOptions.SectionName));
+builder.Services.AddHttpClient<ResendEmailSender>();
+builder.Services.AddHttpClient<SequenzyEmailSender>();
+builder.Services.AddScoped<IEmailSender>(sp =>
+{
+    var options = sp.GetRequiredService<IOptions<EmailOptions>>().Value;
+    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+    var logger = loggerFactory.CreateLogger<IEmailSender>();
+
+    if (string.Equals(options.Provider, "Resend", StringComparison.OrdinalIgnoreCase)
+        && !string.IsNullOrWhiteSpace(options.ResendApiKey))
+    {
+        return sp.GetRequiredService<ResendEmailSender>();
+    }
+
+    if (string.Equals(options.Provider, "Sequenzy", StringComparison.OrdinalIgnoreCase)
+        && !string.IsNullOrWhiteSpace(options.SequenzyApiKey))
+    {
+        return sp.GetRequiredService<SequenzyEmailSender>();
+    }
+
+    logger.LogInformation("Email sender fallback to FileEmailSender (provider={Provider})", options.Provider);
+    return ActivatorUtilities.CreateInstance<FileEmailSender>(sp);
+});
 builder.Services.AddHttpClient<IMomoService, MomoService>(client =>
 {
     client.Timeout = TimeSpan.FromSeconds(30);
@@ -86,7 +111,7 @@ builder.Services.AddCors(options =>
     options.AddPolicy("SpaFrontend", policy =>
     {
         policy
-            .WithOrigins("http://localhost:5173")
+            .WithOrigins("http://localhost:5173", "http://127.0.0.1:5173")
             .AllowAnyHeader()
             .AllowAnyMethod();
     });
