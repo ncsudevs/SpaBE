@@ -5,6 +5,7 @@ using SpaBookingSystem.Api.Dtos.Staff;
 using SpaBookingSystem.Api.Helpers;
 using SpaBookingSystem.ApplicationCore.Entities;
 using SpaBookingSystem.DataLayer;
+using SpaBookingSystem.Api.Dtos;
 
 namespace SpaBookingSystem.Api.Controllers;
 
@@ -225,4 +226,25 @@ public class StaffController : ControllerBase
             .Select(sc => sc.Category!.Name)
             .ToList() ?? new()
     };
+
+    [Authorize(Roles = "ADMIN")]
+    [HttpPatch("bulk/status")]
+    public async Task<IActionResult> BulkUpdateStatus(BulkStatusUpdateDto dto)
+    {
+        var status = (dto.Status ?? string.Empty).Trim().ToUpperInvariant();
+        if (status != "ACTIVE" && status != "INACTIVE")
+            return BadRequest(new { message = "Status must be ACTIVE or INACTIVE" });
+
+        var entities = await _db.Staffs.Where(s => dto.Ids.Contains(s.Id)).ToListAsync();
+        if (entities.Count == 0) return NotFound(new { message = "No staff found" });
+
+        foreach (var s in entities)
+        {
+            s.IsActive = status == "ACTIVE";
+            s.UpdatedAt = DateTime.UtcNow;
+        }
+
+        await _db.SaveChangesAsync();
+        return NoContent();
+    }
 }

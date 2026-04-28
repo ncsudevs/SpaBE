@@ -6,6 +6,7 @@ using SpaBookingSystem.Api.Helpers;
 using SpaBookingSystem.ApplicationCore.Entities;
 using SpaBookingSystem.DataLayer;
 using System.Security.Claims;
+using SpaBookingSystem.Api.Dtos;
 
 namespace SpaBookingSystem.Api.Controllers;
 
@@ -162,6 +163,27 @@ public class ServiceController : ControllerBase
         if (entity == null) return NotFound(new { message = "Service not found" });
 
         _db.Services.Remove(entity);
+        await _db.SaveChangesAsync();
+        return NoContent();
+    }
+
+    [Authorize(Roles = "ADMIN")]
+    [HttpPatch("bulk/status")]
+    public async Task<IActionResult> BulkUpdateStatus(BulkStatusUpdateDto dto)
+    {
+        var status = (dto.Status ?? string.Empty).Trim().ToUpperInvariant();
+        if (status != "ACTIVE" && status != "INACTIVE")
+            return BadRequest(new { message = "Status must be ACTIVE or INACTIVE" });
+
+        var entities = await _db.Services.Where(s => dto.Ids.Contains(s.Id)).ToListAsync();
+        if (entities.Count == 0) return NotFound(new { message = "No services found" });
+
+        foreach (var s in entities)
+        {
+            s.Status = status;
+            s.UpdatedAt = DateTime.UtcNow;
+        }
+
         await _db.SaveChangesAsync();
         return NoContent();
     }

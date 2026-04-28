@@ -362,6 +362,8 @@ MigrationBackup/
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
 /SpaBookingSystem/appsettings.json
+/SpaBookingSystem/appsettings.*.Development.json
+/SpaBookingSystem/appsettings.*.Local.json
 
-# Email pickup (dev-only generated emails)
+# Secrets and email pickup (dev-only generated emails)
 /SpaBookingSystem/wwwroot/email-pickup/

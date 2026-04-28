@@ -215,6 +215,19 @@ public class PaymentsController : ControllerBase
             return BadRequest(new { message = "This booking already has a payment request" });
         }
 
+        // Prevent payment if appointment time has passed today (Bangkok time).
+        var bangkokNow = GetBangkokNow();
+        var todayBk = DateOnly.FromDateTime(bangkokNow.Date);
+        if (booking.AppointmentDate == todayBk)
+        {
+            var appointmentMinutes = ParseTimeToMinutes(booking.AppointmentTime);
+            var nowMinutes = bangkokNow.Hour * 60 + bangkokNow.Minute;
+            if (appointmentMinutes.HasValue && appointmentMinutes.Value <= nowMinutes)
+            {
+                return BadRequest(new { message = "Payment closed because the appointment time has passed." });
+            }
+        }
+
         if (booking.PaymentAttempts >= MaxPaymentAttempts)
         {
             return BadRequest(new { message = "Payment retry limit reached for this booking." });
@@ -322,7 +335,7 @@ public class PaymentsController : ControllerBase
 
                 return StatusCode(502, new
                 {
-                    message = "Could not create the MoMo sandbox payment session.",
+                    message = "Could not create the MoMo sandbox payment session. Please try again.",
                     detail = ex.Message
                 });
             }
@@ -649,6 +662,19 @@ public class PaymentsController : ControllerBase
     {
         if (value.Kind == DateTimeKind.Utc) return value;
         return DateTime.SpecifyKind(value, DateTimeKind.Utc);
+    }
+
+    private static DateTime GetBangkokNow()
+    {
+        try
+        {
+            var tz = TimeZoneInfo.FindSystemTimeZoneById("SE Asia Standard Time");
+            return TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, tz);
+        }
+        catch
+        {
+            return DateTime.UtcNow.AddHours(7); // fallback UTC+7
+        }
     }
 
     private async Task AutoAssignStaffAsync(Booking booking, CancellationToken cancellationToken)

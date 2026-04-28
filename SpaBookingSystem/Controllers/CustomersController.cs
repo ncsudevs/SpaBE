@@ -6,6 +6,7 @@ using SpaBookingSystem.Api.Dtos.Customers;
 using SpaBookingSystem.Api.Dtos.Payments;
 using SpaBookingSystem.DataLayer;
 using SpaBookingSystem.ApplicationCore.Entities;
+using SpaBookingSystem.Api.Helpers;
 
 namespace SpaBookingSystem.Api.Controllers;
 
@@ -83,6 +84,57 @@ public class CustomersController : ControllerBase
         return Ok(dto);
     }
 
+    [Authorize(Roles = "ADMIN")]
+    [HttpDelete("{id:int}")]
+    public async Task<IActionResult> Delete(int id)
+    {
+        var customer = await _db.Customers.FirstOrDefaultAsync(x => x.Id == id);
+        if (customer == null) return NotFound(new { message = "Customer not found" });
+
+        var hasBookings = await _db.Bookings.AnyAsync(b => b.Email.ToLower() == customer.Email.ToLower());
+        if (hasBookings)
+            return Conflict(new { message = "Cannot delete: customer has bookings." });
+
+        _db.Customers.Remove(customer);
+        await _db.SaveChangesAsync();
+        return NoContent();
+    }
+
+    [Authorize(Roles = "ADMIN")]
+    [HttpPut("{id:int}")]
+    public async Task<IActionResult> Update(int id, CustomerUpdateDto dto)
+    {
+        var customer = await _db.Customers.FirstOrDefaultAsync(x => x.Id == id);
+        if (customer == null) return NotFound(new { message = "Customer not found" });
+
+        if (string.IsNullOrWhiteSpace(dto.FullName))
+            return BadRequest(new { message = "Full name is required." });
+
+        if (!string.IsNullOrWhiteSpace(dto.Phone))
+        {
+            if (!PhoneHelper.TryNormalizePhone(dto.Phone, dto.Region, out var normalized, out var phoneError))
+                return BadRequest(new { message = phoneError });
+
+            var existsPhone = await _db.Customers.AnyAsync(x => x.Phone == normalized && x.Id != id);
+            if (existsPhone)
+                return Conflict(new { message = "Phone is already used by another customer." });
+
+            customer.Phone = normalized;
+        }
+        else
+        {
+            customer.Phone = null;
+        }
+
+        customer.FullName = dto.FullName.Trim();
+        customer.IsActive = dto.IsActive;
+        customer.UpdatedAt = DateTime.UtcNow;
+
+        await _db.SaveChangesAsync();
+        return NoContent();
+    }
+    [Authorize(Roles ="ADMIN")]
+    [HttpPost("{id:int}/DE")]
     private static BookingDto MapBooking(Booking booking)
     {
         var firstSlot = booking.BookingDetails.OrderBy(x => x.AppointmentDate).ThenBy(x => x.AppointmentTime).FirstOrDefault();

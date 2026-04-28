@@ -130,6 +130,21 @@ public class BookingsController : ControllerBase
             AppointmentTime = NormalizeTime(x.AppointmentTime)
         }).ToList();
 
+        // Prevent selecting a past time on the same day (Bangkok time).
+        var bangkokNow = GetBangkokNow();
+        var todayBk = DateOnly.FromDateTime(bangkokNow.Date);
+        var nowMinutes = bangkokNow.Hour * 60 + bangkokNow.Minute;
+
+        foreach (var item in normalizedItems)
+        {
+            var parsedMinutes = ParseTimeToMinutes(item.AppointmentTime);
+            if (item.AppointmentDate < todayBk)
+                return BadRequest(new { message = "Appointment date cannot be in the past" });
+
+            if (item.AppointmentDate == todayBk && parsedMinutes.HasValue && parsedMinutes.Value <= nowMinutes)
+                return BadRequest(new { message = "Appointment time must be in the future for today." });
+        }
+
         if (normalizedItems.Any(x => x.Quantity <= 0 || string.IsNullOrWhiteSpace(x.AppointmentTime)))
             return BadRequest(new { message = "Each booking item must have a valid quantity and preferred time" });
 
@@ -481,6 +496,19 @@ public class BookingsController : ControllerBase
     {
         if (value.Kind == DateTimeKind.Utc) return value;
         return DateTime.SpecifyKind(value, DateTimeKind.Utc);
+    }
+
+    private static DateTime GetBangkokNow()
+    {
+        try
+        {
+            var tz = TimeZoneInfo.FindSystemTimeZoneById("SE Asia Standard Time");
+            return TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, tz);
+        }
+        catch
+        {
+            return DateTime.UtcNow.AddHours(7); // fallback UTC+7
+        }
     }
 
     private sealed class NormalizedBookingItem
