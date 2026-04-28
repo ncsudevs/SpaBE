@@ -19,8 +19,10 @@ builder.Services.AddDbContext<SpaDbContext>(options =>
 builder.Services.AddScoped<IPasswordService, PasswordService>();
 builder.Services.AddScoped<ITokenService, TokenService>();
 builder.Services.AddScoped<IAdminSeedService, AdminSeedService>();
+builder.Services.AddScoped<IBookingStaffingService, BookingStaffingService>();
 builder.Services.Configure<EmailOptions>(builder.Configuration.GetSection(EmailOptions.SectionName));
 builder.Services.Configure<MomoOptions>(builder.Configuration.GetSection(MomoOptions.SectionName));
+builder.Services.Configure<BankTransferOptions>(builder.Configuration.GetSection(BankTransferOptions.SectionName));
 builder.Services.AddHttpClient<ResendEmailSender>();
 builder.Services.AddHttpClient<SequenzyEmailSender>();
 builder.Services.AddScoped<IEmailSender>(sp =>
@@ -109,7 +111,7 @@ builder.Services.AddCors(options =>
     options.AddPolicy("SpaFrontend", policy =>
     {
         policy
-            .WithOrigins("http://localhost:5173")
+            .WithOrigins("http://localhost:5173", "http://127.0.0.1:5173")
             .AllowAnyHeader()
             .AllowAnyMethod();
     });

@@ -14,6 +14,7 @@ public class SpaDbContext : DbContext
     public DbSet<Admin> Admins => Set<Admin>();
     public DbSet<Booking> Bookings => Set<Booking>();
     public DbSet<BookingDetail> BookingDetails => Set<BookingDetail>();
+    public DbSet<BookingDetailStaffAssignment> BookingDetailStaffAssignments => Set<BookingDetailStaffAssignment>();
     public DbSet<Payment> Payments => Set<Payment>();
     public DbSet<Staff> Staffs => Set<Staff>();
     public DbSet<StaffServiceCategory> StaffServiceCategories => Set<StaffServiceCategory>();
@@ -227,6 +228,8 @@ public class SpaDbContext : DbContext
 
             e.Property(x => x.IsGroupBooking).HasColumnName("is_group_booking");
             e.Property(x => x.GroupSize).HasColumnName("group_size");
+            e.Property(x => x.IsCheckedIn).HasColumnName("is_checked_in");
+            e.Property(x => x.CheckedInAt).HasColumnName("checked_in_at");
             e.Property(x => x.CreatedAt).HasColumnName("created_at");
             e.Property(x => x.UpdatedAt).HasColumnName("updated_at");
         });
@@ -244,7 +247,6 @@ public class SpaDbContext : DbContext
             e.Property(x => x.AppointmentTime).HasColumnName("appointment_time")
                 .HasMaxLength(20)
                 .IsRequired();
-            e.Property(x => x.StaffId).HasColumnName("staff_id");
 
             e.Property(x => x.UnitPrice).HasColumnName("unit_price")
                 .HasColumnType("decimal(10,2)");
@@ -261,11 +263,30 @@ public class SpaDbContext : DbContext
                 .WithMany()
                 .HasForeignKey(x => x.ServiceId)
                 .OnDelete(DeleteBehavior.Restrict);
+        });
+
+        modelBuilder.Entity<BookingDetailStaffAssignment>(e =>
+        {
+            e.ToTable("booking_detail_staff_assignments");
+            e.HasKey(x => x.Id);
+
+            e.Property(x => x.Id).HasColumnName("assignment_id");
+            e.Property(x => x.BookingDetailId).HasColumnName("booking_detail_id");
+            e.Property(x => x.StaffId).HasColumnName("staff_id");
+            e.Property(x => x.AssignedQuantity).HasColumnName("assigned_quantity");
+            e.Property(x => x.CreatedAt).HasColumnName("created_at");
+
+            e.HasIndex(x => new { x.BookingDetailId, x.StaffId }).IsUnique();
+
+            e.HasOne(x => x.BookingDetail)
+                .WithMany(x => x.StaffAssignments)
+                .HasForeignKey(x => x.BookingDetailId)
+                .OnDelete(DeleteBehavior.Cascade);
 
             e.HasOne(x => x.Staff)
-                .WithMany(x => x.BookingDetails)
+                .WithMany(x => x.BookingDetailStaffAssignments)
                 .HasForeignKey(x => x.StaffId)
-                .OnDelete(DeleteBehavior.SetNull);
+                .OnDelete(DeleteBehavior.Restrict);
         });
 
         modelBuilder.Entity<Payment>(e =>

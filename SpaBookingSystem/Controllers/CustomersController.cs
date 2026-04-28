@@ -7,6 +7,7 @@ using SpaBookingSystem.Api.Dtos.Payments;
 using SpaBookingSystem.DataLayer;
 using SpaBookingSystem.ApplicationCore.Entities;
 using SpaBookingSystem.Api.Helpers;
+using SpaBookingSystem.Api.Services;
 
 namespace SpaBookingSystem.Api.Controllers;
 
@@ -15,10 +16,12 @@ namespace SpaBookingSystem.Api.Controllers;
 public class CustomersController : ControllerBase
 {
     private readonly SpaDbContext _db;
+    private readonly IBookingStaffingService _bookingStaffingService;
 
-    public CustomersController(SpaDbContext db)
+    public CustomersController(SpaDbContext db, IBookingStaffingService bookingStaffingService)
     {
         _db = db;
+        _bookingStaffingService = bookingStaffingService;
     }
 
     [Authorize(Roles = "ADMIN")]
@@ -55,8 +58,11 @@ public class CustomersController : ControllerBase
             .AsNoTracking()
             .Include(b => b.BookingDetails)
                 .ThenInclude(d => d.Service)
+                    .ThenInclude(s => s.Category)
             .Include(b => b.BookingDetails)
-                .ThenInclude(d => d.Staff)
+                .ThenInclude(d => d.StaffAssignments)
+                    .ThenInclude(a => a.Staff)
+            .Include(b => b.Payments)
             .Where(b => b.Email.ToLower() == customer.Email.ToLower())
             .OrderByDescending(b => b.CreatedAt)
             .ToListAsync();
@@ -133,11 +139,13 @@ public class CustomersController : ControllerBase
         await _db.SaveChangesAsync();
         return NoContent();
     }
-    [Authorize(Roles ="ADMIN")]
-    [HttpPost("{id:int}/DE")]
-    private static BookingDto MapBooking(Booking booking)
+    private BookingDto MapBooking(Booking booking)
     {
         var firstSlot = booking.BookingDetails.OrderBy(x => x.AppointmentDate).ThenBy(x => x.AppointmentTime).FirstOrDefault();
+        var latestPayment = booking.Payments?
+            .OrderByDescending(p => p.PaidAt)
+            .ThenByDescending(p => p.Id)
+            .FirstOrDefault();
 
         return new BookingDto
         {
@@ -157,21 +165,41 @@ public class CustomersController : ControllerBase
             CreatedAt = booking.CreatedAt,
             UpdatedAt = booking.UpdatedAt,
             PaymentAttempts = booking.PaymentAttempts,
-            LastPaymentCreatedAt = booking.Payments?
-                .OrderByDescending(p => p.PaidAt)
-                .Select(p => (DateTime?)p.PaidAt)
-                .FirstOrDefault(),
+            LastPaymentCreatedAt = latestPayment?.PaidAt,
+            LatestPaymentId = latestPayment?.Id,
+            LatestPaymentMethod = latestPayment?.Method,
+            IsCheckedIn = booking.IsCheckedIn,
+            CheckedInAt = booking.CheckedInAt,
+            IsFullyStaffed = _bookingStaffingService.IsFullyStaffed(booking),
+            StaffingWarning = _bookingStaffingService.BuildBookingStaffingWarning(booking),
             Items = booking.BookingDetails.OrderBy(x => x.AppointmentDate).ThenBy(x => x.AppointmentTime).Select(d => new BookingItemDto
             {
+                DetailId = d.Id,
                 ServiceId = d.ServiceId,
                 ServiceName = d.Service != null ? d.Service.Name : string.Empty,
+                CategoryId = d.Service?.CategoryId ?? 0,
+                CategoryName = d.Service?.Category?.Name ?? string.Empty,
                 Quantity = d.Quantity,
                 AppointmentDate = d.AppointmentDate,
                 AppointmentTime = d.AppointmentTime,
-                StaffId = d.StaffId,
-                StaffName = d.Staff?.FullName,
+                AssignedQuantity = _bookingStaffingService.GetAssignedQuantity(d),
+                UnassignedQuantity = _bookingStaffingService.GetUnassignedQuantity(d),
+                IsFullyStaffed = _bookingStaffingService.IsFullyStaffed(d),
+                StaffingWarning = _bookingStaffingService.BuildDetailStaffingWarning(d),
                 UnitPrice = d.UnitPrice,
-                LineTotal = d.LineTotal
+                LineTotal = d.LineTotal,
+                StaffAssignments = d.StaffAssignments
+                    .OrderBy(x => x.Staff?.FullName)
+                    .ThenBy(x => x.StaffId)
+                    .Select(x => new BookingItemStaffAssignmentDto
+                    {
+                        Id = x.Id,
+                        StaffId = x.StaffId,
+                        StaffName = x.Staff?.FullName ?? string.Empty,
+                        AssignedQuantity = x.AssignedQuantity,
+                        StaffMaxConcurrent = x.Staff?.MaxConcurrent ?? 0
+                    })
+                    .ToList()
             }).ToList()
         };
     }

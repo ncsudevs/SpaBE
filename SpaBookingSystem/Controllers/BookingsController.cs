@@ -2,10 +2,12 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using SpaBookingSystem.Api.Dtos.Bookings;
+using SpaBookingSystem.ApplicationCore.Constants;
 using SpaBookingSystem.ApplicationCore.Entities;
 using SpaBookingSystem.DataLayer;
 using System.Security.Claims;
 using SpaBookingSystem.Api.Helpers;
+using SpaBookingSystem.Api.Services;
 
 namespace SpaBookingSystem.Api.Controllers;
 
@@ -13,13 +15,21 @@ namespace SpaBookingSystem.Api.Controllers;
 [Route("api/bookings")]
 public class BookingsController : ControllerBase
 {
-    private static readonly string[] AdminAllowedStatuses = ["PENDING", "CONFIRMED", "COMPLETED", "CANCELLED"];
+    private static readonly string[] AdminAllowedStatuses =
+    [
+        BookingStatusNames.Pending,
+        BookingStatusNames.Confirmed,
+        BookingStatusNames.Completed,
+        BookingStatusNames.Cancelled
+    ];
 
     private readonly SpaDbContext _db;
+    private readonly IBookingStaffingService _bookingStaffingService;
 
-    public BookingsController(SpaDbContext db)
+    public BookingsController(SpaDbContext db, IBookingStaffingService bookingStaffingService)
     {
         _db = db;
+        _bookingStaffingService = bookingStaffingService;
     }
 
     [Authorize]
@@ -33,12 +43,14 @@ public class BookingsController : ControllerBase
             .AsNoTracking()
             .Include(x => x.BookingDetails)
                 .ThenInclude(x => x.Service)
+                    .ThenInclude(x => x.Category)
             .Include(x => x.BookingDetails)
-                .ThenInclude(x => x.Staff)
+                .ThenInclude(x => x.StaffAssignments)
+                    .ThenInclude(x => x.Staff)
             .Include(x => x.Payments)
             .AsQueryable();
 
-        if (role == "ADMIN")
+        if (IsManagementRole(role))
         {
             if (!string.IsNullOrWhiteSpace(email))
             {
@@ -66,8 +78,10 @@ public class BookingsController : ControllerBase
             .AsNoTracking()
             .Include(x => x.BookingDetails)
                 .ThenInclude(x => x.Service)
+                    .ThenInclude(x => x.Category)
             .Include(x => x.BookingDetails)
-                .ThenInclude(x => x.Staff)
+                .ThenInclude(x => x.StaffAssignments)
+                    .ThenInclude(x => x.Staff)
             .Include(x => x.Payments)
             .FirstOrDefaultAsync(x => x.Id == id);
 
@@ -75,7 +89,7 @@ public class BookingsController : ControllerBase
 
         var role = User.FindFirstValue(ClaimTypes.Role) ?? string.Empty;
         var currentEmail = User.FindFirstValue(ClaimTypes.Email)?.Trim().ToLowerInvariant();
-        if (role != "ADMIN" && booking.Email.Trim().ToLowerInvariant() != currentEmail)
+        if (!IsManagementRole(role) && booking.Email.Trim().ToLowerInvariant() != currentEmail)
             return Forbid();
 
         return Ok(MapBooking(booking));
@@ -148,9 +162,6 @@ public class BookingsController : ControllerBase
         if (normalizedItems.Any(x => x.Quantity <= 0 || string.IsNullOrWhiteSpace(x.AppointmentTime)))
             return BadRequest(new { message = "Each booking item must have a valid quantity and preferred time" });
 
-        if (normalizedItems.Any(x => x.AppointmentDate < DateOnly.FromDateTime(DateTime.Today)))
-            return BadRequest(new { message = "Appointment date cannot be in the past" });
-
         if (dto.IsGroupBooking)
         {
             if (normalizedItems.Count != 1)
@@ -218,8 +229,8 @@ public class BookingsController : ControllerBase
             AppointmentDate = firstSlot.AppointmentDate,
             AppointmentTime = firstSlot.AppointmentTime,
             Note = string.IsNullOrWhiteSpace(dto.Note) ? null : dto.Note.Trim(),
-            Status = "PENDING",
-            PaymentStatus = "UNPAID",
+            Status = BookingStatusNames.Pending,
+            PaymentStatus = PaymentStatusNames.Unpaid,
             IsGroupBooking = dto.IsGroupBooking,
             GroupSize = totalPeople,
             CreatedAt = DateTime.UtcNow,
@@ -245,11 +256,19 @@ public class BookingsController : ControllerBase
         _db.Bookings.Add(booking);
         await _db.SaveChangesAsync();
 
-        await _db.Entry(booking).Collection(x => x.BookingDetails).Query().Include(x => x.Service).Include(x => x.Staff).LoadAsync();
+        await _db.Entry(booking)
+            .Collection(x => x.BookingDetails)
+            .Query()
+            .Include(x => x.Service)
+                .ThenInclude(x => x.Category)
+            .Include(x => x.StaffAssignments)
+                .ThenInclude(x => x.Staff)
+            .LoadAsync();
+        await _db.Entry(booking).Collection(x => x.Payments).LoadAsync();
         return CreatedAtAction(nameof(GetById), new { id = booking.Id }, MapBooking(booking));
     }
 
-    [Authorize(Roles = "ADMIN")]
+    [Authorize(Roles = $"{RoleNames.Admin},{RoleNames.Cashier}")]
     [HttpPatch("{id:int}/status")]
     public async Task<ActionResult<BookingDto>> UpdateStatus(int id, BookingStatusUpdateDto dto)
     {
@@ -260,67 +279,160 @@ public class BookingsController : ControllerBase
         var booking = await _db.Bookings
             .Include(x => x.BookingDetails)
                 .ThenInclude(x => x.Service)
+                    .ThenInclude(x => x.Category)
             .Include(x => x.BookingDetails)
-                .ThenInclude(x => x.Staff)
+                .ThenInclude(x => x.StaffAssignments)
+                    .ThenInclude(x => x.Staff)
+            .Include(x => x.Payments)
             .FirstOrDefaultAsync(x => x.Id == id);
 
         if (booking == null)
             return NotFound(new { message = "Booking not found" });
 
+        if (status == BookingStatusNames.Confirmed && booking.PaymentStatus != PaymentStatusNames.Paid)
+            return BadRequest(new { message = "Only paid bookings can be confirmed." });
+
+        if (status == BookingStatusNames.Completed)
+        {
+            if (booking.PaymentStatus != PaymentStatusNames.Paid)
+                return BadRequest(new { message = "Check-in can only be completed after payment is confirmed." });
+
+            if (booking.Status != BookingStatusNames.Confirmed && booking.Status != BookingStatusNames.Completed)
+                return BadRequest(new { message = "Booking must be confirmed before it can be completed." });
+
+            if (!booking.IsCheckedIn)
+                return BadRequest(new { message = "Booking must be checked in before it can be completed." });
+
+            if (!_bookingStaffingService.IsFullyStaffed(booking))
+                return BadRequest(new { message = "Assign enough staff quantity to every booking item before completing check-in." });
+        }
+
+        if (status == BookingStatusNames.Pending && booking.PaymentStatus == PaymentStatusNames.Paid)
+            return BadRequest(new { message = "Paid bookings cannot be moved back to PENDING." });
+
+        if (status == BookingStatusNames.Cancelled && booking.Status == BookingStatusNames.Completed)
+            return BadRequest(new { message = "Completed bookings cannot be cancelled." });
+
         booking.Status = status;
         booking.UpdatedAt = DateTime.UtcNow;
 
-        if (status == "CANCELLED")
-            booking.PaymentStatus = booking.PaymentStatus == "PAID" ? "REFUNDED" : booking.PaymentStatus;
+        if (status == BookingStatusNames.Cancelled)
+            booking.PaymentStatus = booking.PaymentStatus == PaymentStatusNames.Paid ? PaymentStatusNames.Refunded : booking.PaymentStatus;
 
         await _db.SaveChangesAsync();
         return Ok(MapBooking(booking));
     }
 
-    [Authorize(Roles = "ADMIN")]
-    [HttpPatch("details/{detailId:int}/staff")]
-    public async Task<ActionResult<BookingDto>> UpdateDetailStaff(int detailId, BookingStaffUpdateDto dto)
+    [Authorize(Roles = $"{RoleNames.Admin},{RoleNames.Cashier}")]
+    [HttpPatch("{id:int}/check-in")]
+    public async Task<ActionResult<BookingDto>> UpdateCheckIn(int id, BookingCheckInUpdateDto dto)
     {
-        var detail = await _db.BookingDetails
-            .Include(d => d.Service)
-            .Include(d => d.Booking)
-            .FirstOrDefaultAsync(d => d.Id == detailId);
+        var booking = await _db.Bookings
+            .Include(x => x.BookingDetails)
+                .ThenInclude(x => x.Service)
+                    .ThenInclude(x => x.Category)
+            .Include(x => x.BookingDetails)
+                .ThenInclude(x => x.StaffAssignments)
+                    .ThenInclude(x => x.Staff)
+            .Include(x => x.Payments)
+            .FirstOrDefaultAsync(x => x.Id == id);
 
+        if (booking == null)
+            return NotFound(new { message = "Booking not found" });
+
+        if (booking.PaymentStatus != PaymentStatusNames.Paid)
+            return Conflict(new { message = "Only paid bookings can be checked in." });
+
+        if (booking.Status == BookingStatusNames.Completed && !dto.IsCheckedIn)
+            return Conflict(new { message = "Completed bookings cannot be unchecked." });
+
+        booking.IsCheckedIn = dto.IsCheckedIn;
+        booking.CheckedInAt = dto.IsCheckedIn ? DateTime.UtcNow : null;
+        booking.UpdatedAt = DateTime.UtcNow;
+
+        await _db.SaveChangesAsync();
+        return Ok(MapBooking(booking));
+    }
+
+    [Authorize(Roles = $"{RoleNames.Admin},{RoleNames.Cashier}")]
+    [HttpPost("details/{detailId:int}/staff-assignments")]
+    public async Task<ActionResult<BookingDto>> AddDetailStaffAssignment(int detailId, BookingStaffAssignmentUpsertDto dto)
+    {
+        if (dto.AssignedQuantity <= 0)
+            return BadRequest(new { message = "Assigned quantity must be greater than zero." });
+
+        var detail = await LoadDetailForAssignmentAsync(detailId);
         if (detail == null || detail.Booking == null)
             return NotFound(new { message = "Booking detail not found" });
 
-        var staff = await _db.Staffs
-            .Include(s => s.StaffCategories)
-            .FirstOrDefaultAsync(s => s.Id == dto.StaffId && s.IsActive);
+        var validationError = await ValidateAssignmentRequestAsync(detail, dto.StaffId, dto.AssignedQuantity);
+        if (validationError != null)
+            return validationError;
 
-        if (staff == null)
-            return NotFound(new { message = "Staff not found or inactive" });
+        if (detail.StaffAssignments.Any(x => x.StaffId == dto.StaffId))
+            return Conflict(new { message = "This staff member is already assigned to the booking detail. Update the existing assignment instead." });
 
-        if (detail.Service == null || !staff.StaffCategories.Any(sc => sc.CategoryId == detail.Service.CategoryId))
-            return Conflict(new { message = "Staff does not match the service category." });
-
-        var duration = detail.Service.Duration;
-        var start = ParseTimeToMinutes(detail.AppointmentTime);
-        if (start == null)
-            return BadRequest(new { message = "Invalid appointment time." });
-
-        var available = await IsStaffAvailableForSlot(
-            staff,
-            detail.AppointmentDate,
-            detail.AppointmentTime!,
-            duration,
-            ignoreDetailId: detail.Id);
-
-        if (!available)
-            return Conflict(new { message = "Staff is busy at this time slot." });
-
-        detail.StaffId = staff.Id;
+        detail.StaffAssignments.Add(new BookingDetailStaffAssignment
+        {
+            StaffId = dto.StaffId,
+            AssignedQuantity = dto.AssignedQuantity,
+            CreatedAt = DateTime.UtcNow,
+        });
         detail.Booking.UpdatedAt = DateTime.UtcNow;
         await _db.SaveChangesAsync();
 
-        await _db.Entry(detail.Booking).Collection(b => b.BookingDetails).Query().Include(x => x.Service).Include(x => x.Staff).LoadAsync();
-        await _db.Entry(detail.Booking).Collection(b => b.Payments).LoadAsync();
+        return Ok(MapBooking(detail.Booking));
+    }
 
+    [Authorize(Roles = $"{RoleNames.Admin},{RoleNames.Cashier}")]
+    [HttpPatch("details/{detailId:int}/staff-assignments/{assignmentId:int}")]
+    public async Task<ActionResult<BookingDto>> UpdateDetailStaffAssignment(int detailId, int assignmentId, BookingStaffAssignmentUpsertDto dto)
+    {
+        if (dto.AssignedQuantity <= 0)
+            return BadRequest(new { message = "Assigned quantity must be greater than zero." });
+
+        var detail = await LoadDetailForAssignmentAsync(detailId);
+        if (detail == null || detail.Booking == null)
+            return NotFound(new { message = "Booking detail not found" });
+
+        var assignment = detail.StaffAssignments.FirstOrDefault(x => x.Id == assignmentId);
+        if (assignment == null)
+            return NotFound(new { message = "Staff assignment not found" });
+
+        if (assignment.StaffId != dto.StaffId && detail.StaffAssignments.Any(x => x.StaffId == dto.StaffId))
+            return Conflict(new { message = "This staff member is already assigned to the booking detail." });
+
+        var validationError = await ValidateAssignmentRequestAsync(detail, dto.StaffId, dto.AssignedQuantity, assignmentId);
+        if (validationError != null)
+            return validationError;
+
+        assignment.StaffId = dto.StaffId;
+        assignment.AssignedQuantity = dto.AssignedQuantity;
+        detail.Booking.UpdatedAt = DateTime.UtcNow;
+
+        await _db.SaveChangesAsync();
+        return Ok(MapBooking(detail.Booking));
+    }
+
+    [Authorize(Roles = $"{RoleNames.Admin},{RoleNames.Cashier}")]
+    [HttpDelete("details/{detailId:int}/staff-assignments/{assignmentId:int}")]
+    public async Task<ActionResult<BookingDto>> DeleteDetailStaffAssignment(int detailId, int assignmentId)
+    {
+        var detail = await LoadDetailForAssignmentAsync(detailId);
+        if (detail == null || detail.Booking == null)
+            return NotFound(new { message = "Booking detail not found" });
+
+        var assignment = detail.StaffAssignments.FirstOrDefault(x => x.Id == assignmentId);
+        if (assignment == null)
+            return NotFound(new { message = "Staff assignment not found" });
+
+        if (detail.Booking.Status == BookingStatusNames.Completed)
+            return Conflict(new { message = "Completed bookings cannot be changed." });
+
+        _db.BookingDetailStaffAssignments.Remove(assignment);
+        detail.Booking.UpdatedAt = DateTime.UtcNow;
+
+        await _db.SaveChangesAsync();
         return Ok(MapBooking(detail.Booking));
     }
 
@@ -331,7 +443,7 @@ public class BookingsController : ControllerBase
         var booking = await _db.Bookings
             .Include(x => x.Payments)
             .Include(x => x.BookingDetails)
-                .ThenInclude(x => x.Staff)
+                .ThenInclude(x => x.StaffAssignments)
             .FirstOrDefaultAsync(x => x.Id == id);
 
         if (booking == null)
@@ -354,7 +466,7 @@ public class BookingsController : ControllerBase
             .Where(x => x.ServiceId == serviceId
                 && x.AppointmentDate == appointmentDate
                 && x.Booking != null
-                && x.Booking.Status != "CANCELLED")
+                && x.Booking.Status != BookingStatusNames.Cancelled)
             .Select(x => new
             {
                 x.Quantity,
@@ -409,7 +521,7 @@ public class BookingsController : ControllerBase
             .Include(x => x.Booking)
             .Where(x => x.Booking != null
                 && x.Booking.Email.ToLower() == currentEmail
-                && x.Booking.Status != "CANCELLED"
+                && x.Booking.Status != BookingStatusNames.Cancelled
                 && dates.Contains(x.AppointmentDate)
                 && times.Contains(x.AppointmentTime))
             .Select(x => new { x.AppointmentDate, x.AppointmentTime })
@@ -418,40 +530,81 @@ public class BookingsController : ControllerBase
         return slots.Where(slot => existing.Any(x => x.AppointmentDate == slot.AppointmentDate && x.AppointmentTime == slot.AppointmentTime)).ToList();
     }
 
-    private async Task<bool> IsStaffAvailableForSlot(Staff staff, DateOnly date, string time, int durationMinutes, int? ignoreDetailId = null)
+    private async Task<BookingDetail?> LoadDetailForAssignmentAsync(int detailId)
     {
-        var start = ParseTimeToMinutes(time);
-        if (start == null) return false;
-        var targetEnd = start.Value + Math.Max(1, durationMinutes);
-
-        var assigned = await _db.BookingDetails
-            .AsNoTracking()
+        return await _db.BookingDetails
             .Include(d => d.Service)
+                .ThenInclude(x => x!.Category)
             .Include(d => d.Booking)
-            .Where(d => d.StaffId == staff.Id
-                && d.AppointmentDate == date
-                && d.Booking != null
-                && d.Booking.Status != "CANCELLED"
-                && d.Id != ignoreDetailId)
-            .ToListAsync();
-
-        var overlapCount = 0;
-        foreach (var d in assigned)
-        {
-            var existingStart = ParseTimeToMinutes(d.AppointmentTime);
-            if (existingStart == null) continue;
-            var existingDuration = d.Service?.Duration ?? durationMinutes;
-            var existingEnd = existingStart.Value + Math.Max(1, existingDuration);
-            var overlap = existingStart.Value < targetEnd && start.Value < existingEnd;
-            if (overlap) overlapCount += 1;
-        }
-
-        return overlapCount < staff.MaxConcurrent;
+                .ThenInclude(x => x!.Payments)
+            .Include(d => d.Booking)
+                .ThenInclude(x => x!.BookingDetails)
+                    .ThenInclude(x => x.Service)
+                        .ThenInclude(x => x!.Category)
+            .Include(d => d.Booking)
+                .ThenInclude(x => x!.BookingDetails)
+                    .ThenInclude(x => x.StaffAssignments)
+                        .ThenInclude(x => x.Staff)
+            .FirstOrDefaultAsync(d => d.Id == detailId);
     }
 
-    private static BookingDto MapBooking(Booking booking)
+    private async Task<ActionResult?> ValidateAssignmentRequestAsync(
+        BookingDetail detail,
+        int staffId,
+        int assignedQuantity,
+        int? ignoreAssignmentId = null)
+    {
+        if (detail.Booking == null)
+            return NotFound(new { message = "Booking not found" });
+
+        if (detail.Booking.PaymentStatus != PaymentStatusNames.Paid)
+            return Conflict(new { message = "Staff can only be assigned after payment is confirmed." });
+
+        if (detail.Booking.Status == BookingStatusNames.Completed)
+            return Conflict(new { message = "Completed bookings cannot be changed." });
+
+        var totalAssignedElsewhere = detail.StaffAssignments
+            .Where(x => x.Id != ignoreAssignmentId)
+            .Sum(x => x.AssignedQuantity);
+
+        if (totalAssignedElsewhere + assignedQuantity > detail.Quantity)
+            return Conflict(new { message = $"Assigned quantity exceeds the required service quantity ({detail.Quantity})." });
+
+        var staff = await _db.Staffs
+            .Include(s => s.StaffCategories)
+            .FirstOrDefaultAsync(s => s.Id == staffId && s.IsActive);
+
+        if (staff == null)
+            return NotFound(new { message = "Staff not found or inactive" });
+
+        if (detail.Service == null || !staff.StaffCategories.Any(sc => sc.CategoryId == detail.Service.CategoryId))
+            return Conflict(new { message = "Staff does not match the service category." });
+
+        var remainingCapacity = await _bookingStaffingService.GetRemainingCapacityAsync(
+            staff,
+            detail.AppointmentDate,
+            detail.AppointmentTime ?? string.Empty,
+            detail.Service.Duration,
+            ignoreAssignmentId);
+
+        if (assignedQuantity > remainingCapacity)
+        {
+            return Conflict(new
+            {
+                message = $"{staff.FullName} only has {remainingCapacity} slot(s) of remaining capacity at this time."
+            });
+        }
+
+        return null;
+    }
+
+    private BookingDto MapBooking(Booking booking)
     {
         var firstSlot = booking.BookingDetails.OrderBy(x => x.AppointmentDate).ThenBy(x => x.AppointmentTime).FirstOrDefault();
+        var latestPayment = booking.Payments?
+            .OrderByDescending(p => p.PaidAt)
+            .ThenByDescending(p => p.Id)
+            .FirstOrDefault();
 
         return new BookingDto
         {
@@ -471,21 +624,41 @@ public class BookingsController : ControllerBase
             CreatedAt = ToUtc(booking.CreatedAt),
             UpdatedAt = ToUtc(booking.UpdatedAt),
             PaymentAttempts = booking.PaymentAttempts,
-            LastPaymentCreatedAt = booking.Payments?
-                .OrderByDescending(p => p.PaidAt)
-                .Select(p => (DateTime?)ToUtc(p.PaidAt))
-                .FirstOrDefault(),
+            LastPaymentCreatedAt = latestPayment != null ? ToUtc(latestPayment.PaidAt) : null,
+            LatestPaymentId = latestPayment?.Id,
+            LatestPaymentMethod = latestPayment?.Method,
+            IsCheckedIn = booking.IsCheckedIn,
+            CheckedInAt = booking.CheckedInAt != null ? ToUtc(booking.CheckedInAt.Value) : null,
+            IsFullyStaffed = _bookingStaffingService.IsFullyStaffed(booking),
+            StaffingWarning = _bookingStaffingService.BuildBookingStaffingWarning(booking),
             Items = booking.BookingDetails.OrderBy(x => x.AppointmentDate).ThenBy(x => x.AppointmentTime).Select(d => new BookingItemDto
             {
+                DetailId = d.Id,
                 ServiceId = d.ServiceId,
                 ServiceName = d.Service != null ? d.Service.Name : string.Empty,
+                CategoryId = d.Service?.CategoryId ?? 0,
+                CategoryName = d.Service?.Category?.Name ?? string.Empty,
                 Quantity = d.Quantity,
                 AppointmentDate = d.AppointmentDate,
                 AppointmentTime = d.AppointmentTime,
-                StaffId = d.StaffId,
-                StaffName = d.Staff?.FullName,
+                AssignedQuantity = _bookingStaffingService.GetAssignedQuantity(d),
+                UnassignedQuantity = _bookingStaffingService.GetUnassignedQuantity(d),
+                IsFullyStaffed = _bookingStaffingService.IsFullyStaffed(d),
+                StaffingWarning = _bookingStaffingService.BuildDetailStaffingWarning(d),
                 UnitPrice = d.UnitPrice,
-                LineTotal = d.LineTotal
+                LineTotal = d.LineTotal,
+                StaffAssignments = d.StaffAssignments
+                    .OrderBy(x => x.Staff?.FullName)
+                    .ThenBy(x => x.StaffId)
+                    .Select(x => new BookingItemStaffAssignmentDto
+                    {
+                        Id = x.Id,
+                        StaffId = x.StaffId,
+                        StaffName = x.Staff?.FullName ?? string.Empty,
+                        AssignedQuantity = x.AssignedQuantity,
+                        StaffMaxConcurrent = x.Staff?.MaxConcurrent ?? 0,
+                    })
+                    .ToList()
             }).ToList()
         };
     }
@@ -510,6 +683,9 @@ public class BookingsController : ControllerBase
             return DateTime.UtcNow.AddHours(7); // fallback UTC+7
         }
     }
+
+    private static bool IsManagementRole(string role) =>
+        role == RoleNames.Admin || role == RoleNames.Cashier;
 
     private sealed class NormalizedBookingItem
     {

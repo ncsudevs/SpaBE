@@ -9,8 +9,10 @@ using SpaBookingSystem.Api.Dtos.Payments;
 using SpaBookingSystem.Api.Options;
 using SpaBookingSystem.Api.Services.Email;
 using SpaBookingSystem.Api.Services.Momo;
+using SpaBookingSystem.Api.Services;
+using SpaBookingSystem.ApplicationCore.Constants;
 using SpaBookingSystem.ApplicationCore.Entities;
-using SpaBookingSystem.DataLayer; 
+using SpaBookingSystem.DataLayer;
 
 namespace SpaBookingSystem.Api.Controllers;
 
@@ -18,16 +20,24 @@ namespace SpaBookingSystem.Api.Controllers;
 [Route("api/payments")]
 public class PaymentsController : ControllerBase
 {
-    private static readonly string[] AllowedMethods = ["MOMO"];
-    private static readonly string[] AdminAllowedStatuses = ["PENDING", "PAID", "REJECTED", "REFUNDED"];
+    private static readonly string[] AllowedMethods = [PaymentMethodNames.Momo, PaymentMethodNames.BankTransfer];
+    private static readonly string[] AdminAllowedStatuses =
+    [
+        PaymentStatusNames.Pending,
+        PaymentStatusNames.Paid,
+        PaymentStatusNames.Rejected,
+        PaymentStatusNames.Refunded
+    ];
+
     private static readonly TimeSpan PaymentTtl = TimeSpan.FromMinutes(5);
-    //private static readonly TimeSpan PaymentTtl = TimeSpan.FromSeconds(10);
-    private const int MaxPaymentAttempts = 3; // 1 initial + 2 retries
+    private const int MaxPaymentAttempts = 3;
 
     private readonly SpaDbContext _db;
     private readonly IEmailSender _emailSender;
     private readonly IMomoService _momoService;
     private readonly MomoOptions _momoOptions;
+    private readonly BankTransferOptions _bankTransferOptions;
+    private readonly IBookingStaffingService _bookingStaffingService;
     private readonly ILogger<PaymentsController> _logger;
 
     public PaymentsController(
@@ -35,16 +45,20 @@ public class PaymentsController : ControllerBase
         IEmailSender emailSender,
         IMomoService momoService,
         IOptions<MomoOptions> momoOptions,
+        IOptions<BankTransferOptions> bankTransferOptions,
+        IBookingStaffingService bookingStaffingService,
         ILogger<PaymentsController> logger)
     {
         _db = db;
         _emailSender = emailSender;
         _momoService = momoService;
         _momoOptions = momoOptions.Value;
+        _bankTransferOptions = bankTransferOptions.Value;
+        _bookingStaffingService = bookingStaffingService;
         _logger = logger;
     }
 
-    [Authorize(Roles = "ADMIN")]
+    [Authorize(Roles = $"{RoleNames.Admin},{RoleNames.Cashier}")]
     [HttpGet]
     public async Task<ActionResult<List<PaymentDto>>> GetAll()
     {
@@ -67,319 +81,218 @@ public class PaymentsController : ControllerBase
             .FirstOrDefaultAsync(x => x.Id == id);
 
         if (entity == null)
-        {
             return NotFound(new { message = "Payment not found" });
-        }
 
-        var role = User.FindFirstValue(ClaimTypes.Role) ?? string.Empty;
-        var currentEmail = User.FindFirstValue(ClaimTypes.Email)?.Trim().ToLowerInvariant();
-        if (role != "ADMIN" && entity.Booking?.Email.Trim().ToLowerInvariant() != currentEmail)
-        {
+        if (!CanAccessPayment(entity.Booking))
             return Forbid();
-        }
 
         return Ok(MapPayment(entity));
     }
 
-    [Authorize(Roles = "CUSTOMER")]
+    [Authorize]
+    [HttpGet("booking/{bookingId:int}/latest")]
+    public async Task<ActionResult<PaymentDto>> GetLatestByBooking(int bookingId)
+    {
+        var booking = await _db.Bookings
+            .AsNoTracking()
+            .Include(x => x.Payments)
+            .FirstOrDefaultAsync(x => x.Id == bookingId);
+
+        if (booking == null)
+            return NotFound(new { message = "Booking not found" });
+
+        if (!CanAccessBooking(booking))
+            return Forbid();
+
+        var latestPayment = booking.Payments
+            .OrderByDescending(x => x.PaidAt)
+            .ThenByDescending(x => x.Id)
+            .FirstOrDefault();
+
+        if (latestPayment == null)
+            return NotFound(new { message = "No payment request found for this booking" });
+
+        await _db.Entry(latestPayment).Reference(x => x.Booking).LoadAsync();
+        return Ok(MapPayment(latestPayment));
+    }
+
+    [Authorize(Roles = RoleNames.Customer)]
     [HttpPost]
     public async Task<ActionResult<PaymentDto>> Create(PaymentCreateDto dto, CancellationToken cancellationToken)
     {
-        string? redirectUrl = null;
-        string? ipnUrl = null;
-
-        var method = (dto.Method ?? string.Empty).Trim().ToUpperInvariant();
+        var method = NormalizeMethod(dto.Method);
         if (!AllowedMethods.Contains(method))
-        {
             return BadRequest(new { message = "Invalid payment method" });
-        }
 
-        var currentEmail = User.FindFirstValue(ClaimTypes.Email)?.Trim().ToLowerInvariant();
+        var currentEmail = GetCurrentEmail();
         if (string.IsNullOrWhiteSpace(currentEmail))
-        {
             return Unauthorized(new { message = "Invalid token" });
-        }
 
         var booking = await _db.Bookings
             .Include(x => x.Payments)
             .Include(x => x.BookingDetails)
-            .ThenInclude(x => x.Service)
+                .ThenInclude(x => x.Service)
             .FirstOrDefaultAsync(x => x.Id == dto.BookingId, cancellationToken);
 
         if (booking == null)
-        {
             return NotFound(new { message = "Booking not found" });
-        }
 
-        if (booking.Email.Trim().ToLowerInvariant() != currentEmail)
-        {
+        if (!string.Equals(booking.Email.Trim(), currentEmail, StringComparison.OrdinalIgnoreCase))
             return Forbid();
+
+        if (booking.PaymentStatus == PaymentStatusNames.Paid)
+            return BadRequest(new { message = "This booking has already been paid." });
+
+        var availabilityError = ValidateBookingPaymentWindow(booking);
+        if (availabilityError is not null)
+            return BadRequest(new { message = availabilityError });
+
+        var latestActivePayment = booking.Payments
+            .OrderByDescending(p => p.PaidAt)
+            .ThenByDescending(p => p.Id)
+            .FirstOrDefault(p => IsActivePaymentStatus(p.Status));
+
+        if (latestActivePayment != null)
+        {
+            if (latestActivePayment.Method == PaymentMethodNames.Momo && method == PaymentMethodNames.Momo)
+                return await ReuseOrRefreshMomoPaymentAsync(booking, latestActivePayment, cancellationToken);
+
+            if (latestActivePayment.Method == PaymentMethodNames.BankTransfer && method == PaymentMethodNames.BankTransfer)
+                return Ok(MapPayment(latestActivePayment));
+
+            return BadRequest(new { message = "This booking already has an active payment request." });
         }
 
-        var existingPending = booking.Payments
-            .FirstOrDefault(p => p.Method == "MOMO" && p.Status == "PENDING");
-
-        // If there is an existing MoMo pending payment, either reuse (if still valid) or mark rejected then create new.
-        if (existingPending != null)
-        {
-            var expired = existingPending.PaidAt.Add(PaymentTtl) <= DateTime.UtcNow;
-            if (expired)
-            {
-                existingPending.Status = "REJECTED";
-                booking.PaymentStatus = "REJECTED";
-                if (booking.Status == "CONFIRMED")
-                {
-                    booking.Status = "PENDING";
-                }
-                await _db.SaveChangesAsync(cancellationToken);
-            }
-            else
-            {
-                string? redirect = null;
-                string? ipn = null;
-                try
-                {
-                    redirect = BuildPublicReturnUrl(booking, existingPending);
-                    ipn = BuildIpnUrl();
-                    var extraData = BuildExtraData(booking, existingPending);
-                    var requestId = $"REQ-{existingPending.PaymentCode}-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}";
-                    var newOrderId = $"MOMO-{booking.BookingCode}-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}";
-                    existingPending.TransactionCode = newOrderId;
-
-                    var momoRequestReuse = new MomoCreatePaymentRequest
-                    {
-                        AccessKey = _momoOptions.AccessKey,
-                        PartnerCode = _momoOptions.PartnerCode,
-                        RequestId = requestId,
-                        Amount = Convert.ToInt64(existingPending.Amount),
-                        OrderId = newOrderId,
-                        OrderInfo = $"SuSpa payment for {booking.BookingCode}",
-                        RedirectUrl = redirect,
-                        IpnUrl = ipn,
-                        ExtraData = extraData,
-                        RequestType = "captureWallet",
-                        Lang = "en",
-                        PartnerName = string.IsNullOrWhiteSpace(_momoOptions.PartnerName) ? _momoOptions.StoreName : _momoOptions.PartnerName,
-                        StoreId = string.IsNullOrWhiteSpace(_momoOptions.StoreId) ? "SuSpaStore" : _momoOptions.StoreId,
-                        StoreName = _momoOptions.StoreName,
-                        AutoCapture = true,
-                        UserInfo = new
-                        {
-                            name = booking.FullName,
-                            phoneNumber = booking.Phone,
-                            email = booking.Email
-                        }
-                    };
-
-                    var momoResponseReuse = await _momoService.CreatePaymentAsync(momoRequestReuse, cancellationToken);
-                    if (momoResponseReuse.ResultCode != 0 || string.IsNullOrWhiteSpace(momoResponseReuse.PayUrl))
-                    {
-                        return BadRequest(new
-                        {
-                            message = string.IsNullOrWhiteSpace(momoResponseReuse.Message)
-                                ? "MoMo could not create the payment session."
-                                : momoResponseReuse.Message,
-                            resultCode = momoResponseReuse.ResultCode
-                        });
-                    }
-
-                    booking.PaymentStatus = "PENDING";
-                    booking.UpdatedAt = DateTime.UtcNow;
-                    await _db.SaveChangesAsync(cancellationToken);
-
-                    var reuseResponse = MapPayment(existingPending, momoResponseReuse, _momoOptions.UseSandbox);
-                    reuseResponse.BookingCode = booking.BookingCode;
-                    return Ok(reuseResponse);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(
-                        ex,
-                        "Failed to recreate MoMo sandbox payment for booking {BookingCode}. OrderId={OrderId}, RedirectUrl={RedirectUrl}, IpnUrl={IpnUrl}",
-                        booking.BookingCode,
-                        existingPending.TransactionCode,
-                        redirect,
-                        ipn);
-
-                    return StatusCode(502, new
-                    {
-                        message = "Could not create the MoMo sandbox payment session.",
-                        detail = ex.Message
-                    });
-                }
-            }
-        }
-
-        if (booking.PaymentStatus == "PAID" || booking.PaymentStatus == "PENDING")
-        {
-            return BadRequest(new { message = "This booking already has a payment request" });
-        }
-
-        // Prevent payment if appointment time has passed today (Bangkok time).
-        var bangkokNow = GetBangkokNow();
-        var todayBk = DateOnly.FromDateTime(bangkokNow.Date);
-        if (booking.AppointmentDate == todayBk)
-        {
-            var appointmentMinutes = ParseTimeToMinutes(booking.AppointmentTime);
-            var nowMinutes = bangkokNow.Hour * 60 + bangkokNow.Minute;
-            if (appointmentMinutes.HasValue && appointmentMinutes.Value <= nowMinutes)
-            {
-                return BadRequest(new { message = "Payment closed because the appointment time has passed." });
-            }
-        }
-
-        if (booking.PaymentAttempts >= MaxPaymentAttempts)
-        {
+        if (method == PaymentMethodNames.Momo && booking.PaymentAttempts >= MaxPaymentAttempts)
             return BadRequest(new { message = "Payment retry limit reached for this booking." });
-        }
-
-        if (booking.AppointmentDate < DateOnly.FromDateTime(DateTime.UtcNow.Date))
-        {
-            return BadRequest(new { message = "This booking date has passed. Payment is no longer available." });
-        }
 
         var paymentCode = $"PAY-{DateTime.UtcNow:yyyyMMddHHmmss}";
-        var orderId = $"MOMO-{booking.BookingCode}-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}";
-        var momoAmount = Convert.ToInt64(decimal.Round(booking.TotalAmount, 0, MidpointRounding.AwayFromZero));
         var payment = new Payment
         {
             BookingId = booking.Id,
             PaymentCode = paymentCode,
             Method = method,
-            Amount = method == "MOMO"
-                ? momoAmount
+            Amount = method == PaymentMethodNames.Momo
+                ? Convert.ToInt64(decimal.Round(booking.TotalAmount, 0, MidpointRounding.AwayFromZero))
                 : booking.TotalAmount,
-            Status = "PENDING",
+            Status = method == PaymentMethodNames.Momo
+                ? PaymentStatusNames.Pending
+                : PaymentStatusNames.AwaitingTransfer,
             PaidAt = DateTime.UtcNow,
-            TransactionCode = method == "MOMO"
-                ? orderId
-                : $"TXN-{Guid.NewGuid().ToString("N")[..10].ToUpperInvariant()}"
+            TransactionCode = method == PaymentMethodNames.Momo
+                ? BuildMomoOrderId(booking)
+                : $"BANK-{Guid.NewGuid().ToString("N")[..10].ToUpperInvariant()}"
         };
-
-        booking.PaymentAttempts += 1;
 
         MomoCreatePaymentResponse? momoResponse = null;
 
-        if (method == "MOMO")
+        if (method == PaymentMethodNames.Momo)
         {
-            if (!_momoOptions.Enabled
-                || string.IsNullOrWhiteSpace(_momoOptions.PartnerCode)
-                || string.IsNullOrWhiteSpace(_momoOptions.AccessKey)
-                || string.IsNullOrWhiteSpace(_momoOptions.SecretKey))
-            {
-                return BadRequest(new { message = "MoMo sandbox is not configured yet. Please update appsettings.json with PartnerCode, AccessKey and SecretKey." });
-            }
-
-            if (momoAmount < 1000 || momoAmount > 50_000_000)
-            {
-                return BadRequest(new
-                {
-                    message = "MoMo requires amount between 1,000 VND and 50,000,000 VND. Please update service prices to VND.",
-                    amount = momoAmount
-                });
-            }
+            booking.PaymentAttempts += 1;
+            var momoValidationError = ValidateMomoAmount(payment.Amount);
+            if (momoValidationError is not null)
+                return BadRequest(new { message = momoValidationError });
 
             try
             {
-                redirectUrl = BuildPublicReturnUrl(booking, payment);
-                ipnUrl = BuildIpnUrl();
-                var extraData = BuildExtraData(booking, payment);
-                var requestId = $"REQ-{payment.PaymentCode}-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}";
-
-                var momoRequest = new MomoCreatePaymentRequest
-                {
-                    AccessKey = _momoOptions.AccessKey,
-                    PartnerCode = _momoOptions.PartnerCode,
-                    RequestId = requestId,
-                    Amount = momoAmount,
-                    OrderId = orderId,
-                    OrderInfo = $"SuSpa payment for {booking.BookingCode}",
-                    RedirectUrl = redirectUrl,
-                    IpnUrl = ipnUrl,
-                    ExtraData = extraData,
-                    RequestType = "captureWallet",
-                    Lang = "en",
-                    PartnerName = string.IsNullOrWhiteSpace(_momoOptions.PartnerName) ? _momoOptions.StoreName : _momoOptions.PartnerName,
-                    StoreId = string.IsNullOrWhiteSpace(_momoOptions.StoreId) ? "SuSpaStore" : _momoOptions.StoreId,
-                    StoreName = _momoOptions.StoreName,
-                    AutoCapture = true,
-                    UserInfo = new
-                    {
-                        name = booking.FullName,
-                        phoneNumber = booking.Phone,
-                        email = booking.Email
-                    }
-                };
-
-                momoResponse = await _momoService.CreatePaymentAsync(momoRequest, cancellationToken);
-                if (momoResponse.ResultCode != 0 || string.IsNullOrWhiteSpace(momoResponse.PayUrl))
-                {
-                    return BadRequest(new
-                    {
-                        message = string.IsNullOrWhiteSpace(momoResponse.Message)
-                            ? "MoMo could not create the payment session."
-                            : momoResponse.Message,
-                        resultCode = momoResponse.ResultCode
-                    });
-                }
+                momoResponse = await CreateNewMomoPaymentAsync(booking, payment, cancellationToken);
             }
             catch (Exception ex)
             {
-                _logger.LogError(
-                    ex,
-                    "Failed to create MoMo sandbox payment for booking {BookingCode}. OrderId={OrderId}, RedirectUrl={RedirectUrl}, IpnUrl={IpnUrl}",
-                    booking.BookingCode,
-                    orderId,
-                    redirectUrl,
-                    ipnUrl);
-
+                _logger.LogError(ex, "Failed to create MoMo sandbox payment for booking {BookingCode}", booking.BookingCode);
                 return StatusCode(502, new
                 {
                     message = "Could not create the MoMo sandbox payment session. Please try again.",
                     detail = ex.Message
                 });
             }
+
+            booking.PaymentStatus = PaymentStatusNames.Pending;
+        }
+        else
+        {
+            booking.PaymentStatus = PaymentStatusNames.AwaitingTransfer;
         }
 
-        _db.Payments.Add(payment);
-        booking.PaymentStatus = "PENDING";
         booking.UpdatedAt = DateTime.UtcNow;
+
+        _db.Payments.Add(payment);
         await _db.SaveChangesAsync(cancellationToken);
 
         var response = MapPayment(payment, momoResponse, _momoOptions.UseSandbox);
-        response.BookingCode = booking.BookingCode;
-
-        await _emailSender.SendAsync(
-            booking.Email,
-            method == "MOMO" ? "SuSpa MoMo payment created" : "SuSpa payment request created",
-            EmailTemplateService.BuildPaymentRequestTemplate(
-                booking.FullName,
-                booking.BookingCode,
-                payment.PaymentCode,
-                payment.Method,
-                payment.Amount,
-                response.PaymentContent),
-            cancellationToken);
+        await SendCreatedPaymentEmailAsync(booking, response, cancellationToken);
 
         return CreatedAtAction(nameof(GetById), new { id = payment.Id }, response);
     }
 
+    [Authorize(Roles = RoleNames.Customer)]
+    [HttpPatch("{id:int}/confirm-transfer")]
+    public async Task<ActionResult<PaymentDto>> ConfirmTransfer(int id, CancellationToken cancellationToken)
+    {
+        var currentEmail = GetCurrentEmail();
+        if (string.IsNullOrWhiteSpace(currentEmail))
+            return Unauthorized(new { message = "Invalid token" });
+
+        var payment = await _db.Payments
+            .Include(x => x.Booking)
+            .FirstOrDefaultAsync(x => x.Id == id, cancellationToken);
+
+        if (payment == null || payment.Booking == null)
+            return NotFound(new { message = "Payment not found" });
+
+        if (!string.Equals(payment.Booking.Email.Trim(), currentEmail, StringComparison.OrdinalIgnoreCase))
+            return Forbid();
+
+        if (payment.Method != PaymentMethodNames.BankTransfer)
+            return BadRequest(new { message = "Only bank transfer payments can be confirmed manually." });
+
+        if (payment.Status != PaymentStatusNames.AwaitingTransfer)
+            return BadRequest(new { message = "This transfer confirmation has already been submitted." });
+
+        payment.Status = PaymentStatusNames.Pending;
+        payment.PaidAt = DateTime.UtcNow;
+        payment.Booking.PaymentStatus = PaymentStatusNames.Pending;
+        payment.Booking.Status = BookingStatusNames.Pending;
+        payment.Booking.UpdatedAt = DateTime.UtcNow;
+
+        await _db.SaveChangesAsync(cancellationToken);
+
+        await NotifyCashiersAsync(payment.Booking, payment, cancellationToken);
+        await _emailSender.SendAsync(
+            payment.Booking.Email,
+            "SuSpa transfer confirmation received",
+            EmailTemplateService.BuildBankTransferSubmittedTemplate(
+                payment.Booking.FullName,
+                payment.Booking.BookingCode,
+                payment.PaymentCode),
+            cancellationToken);
+
+        return Ok(MapPayment(payment));
+    }
+
     [AllowAnonymous]
     [HttpGet("momo/return")]
-    public IActionResult ReceiveMomoReturn(
+    public async Task<IActionResult> ReceiveMomoReturn(
         [FromQuery] string? bookingCode,
         [FromQuery] string? paymentCode,
         [FromQuery] string? resultCode,
         [FromQuery] string? orderId,
         [FromQuery] string? requestId,
         [FromQuery] string? transId,
-        [FromQuery] string? message)
+        [FromQuery] string? message,
+        CancellationToken cancellationToken)
     {
+        await TryApplySandboxReturnFallbackAsync(
+            bookingCode,
+            paymentCode,
+            resultCode,
+            orderId,
+            transId,
+            cancellationToken);
+
         var frontendUrl = (_momoOptions.FrontendReturnUrl ?? string.Empty).Trim();
         if (string.IsNullOrWhiteSpace(frontendUrl))
-        {
             return Content("MoMo return received, but FrontendReturnUrl is not configured.", "text/plain");
-        }
 
         var query = new List<string>();
 
@@ -412,7 +325,7 @@ public class PaymentsController : ControllerBase
         var payment = await _db.Payments
             .Include(x => x.Booking)
             .FirstOrDefaultAsync(
-                x => x.Method == "MOMO"
+                x => x.Method == PaymentMethodNames.Momo
                     && x.TransactionCode != null
                     && x.TransactionCode.StartsWith(request.OrderId),
                 cancellationToken);
@@ -424,20 +337,14 @@ public class PaymentsController : ControllerBase
         }
 
         if (payment.Booking == null)
-        {
             return NoContent();
-        }
 
-        // TTL guard: reject IPN if the payment session expired.
         var expired = payment.PaidAt.Add(PaymentTtl) <= DateTime.UtcNow;
         if (expired)
         {
-            payment.Status = "REJECTED";
-            payment.Booking.PaymentStatus = "REJECTED";
-            if (payment.Booking.Status == "CONFIRMED")
-            {
-                payment.Booking.Status = "PENDING";
-            }
+            payment.Status = PaymentStatusNames.Rejected;
+            payment.Booking.PaymentStatus = PaymentStatusNames.Rejected;
+            payment.Booking.Status = BookingStatusNames.Pending;
             payment.Booking.UpdatedAt = DateTime.UtcNow;
             await _db.SaveChangesAsync(cancellationToken);
             _logger.LogInformation("Ignored MoMo IPN because session expired for order {OrderId}", request.OrderId);
@@ -456,76 +363,71 @@ public class PaymentsController : ControllerBase
 
         if (request.ResultCode == 0)
         {
-            payment.Status = "PAID";
-            payment.Booking.PaymentStatus = "PAID";
-            payment.Booking.Status = "CONFIRMED";
-
-            await AutoAssignStaffAsync(payment.Booking, cancellationToken);
-
-            await _emailSender.SendAsync(
-                payment.Booking.Email,
-                "SuSpa payment confirmed",
-                EmailTemplateService.BuildPaymentConfirmedTemplate(
-                    payment.Booking.FullName,
-                    payment.Booking.BookingCode,
-                    payment.PaymentCode),
-                cancellationToken);
+            await ApplySuccessfulPaymentAsync(payment, request.OrderId, request.TransId.ToString(), cancellationToken);
         }
         else
         {
-            payment.Status = "REJECTED";
-            payment.Booking.PaymentStatus = "REJECTED";
-            payment.Booking.Status = "CANCELLED";
-
-            await _emailSender.SendAsync(
-                payment.Booking.Email,
-                "SuSpa payment rejected",
-                EmailTemplateService.BuildPaymentRejectedTemplate(
-                    payment.Booking.FullName,
-                    payment.Booking.BookingCode,
-                    payment.PaymentCode),
-                cancellationToken);
+            await ApplyRejectedPaymentAsync(payment, BookingStatusNames.Cancelled, cancellationToken);
         }
 
         await _db.SaveChangesAsync(cancellationToken);
         return NoContent();
     }
 
-    [Authorize(Roles = "ADMIN")]
+    [Authorize(Roles = $"{RoleNames.Admin},{RoleNames.Cashier}")]
     [HttpPatch("{id:int}/status")]
     public async Task<ActionResult<PaymentDto>> UpdateStatus(int id, PaymentStatusUpdateDto dto)
     {
-        var status = (dto.Status ?? string.Empty).Trim().ToUpperInvariant();
+        var status = NormalizeStatus(dto.Status);
         if (!AdminAllowedStatuses.Contains(status))
-        {
             return BadRequest(new { message = "Invalid payment status" });
-        }
 
         var payment = await _db.Payments
             .Include(x => x.Booking)
             .FirstOrDefaultAsync(x => x.Id == id);
 
-        if (payment == null)
-        {
+        if (payment == null || payment.Booking == null)
             return NotFound(new { message = "Payment not found" });
+
+        if (payment.Method == PaymentMethodNames.Momo)
+        {
+            return BadRequest(new
+            {
+                message = "MoMo payments are updated automatically after the customer completes the hosted payment page."
+            });
         }
 
-        if (string.Equals(payment.Method, "MOMO", StringComparison.OrdinalIgnoreCase))
+        if (payment.Status == PaymentStatusNames.AwaitingTransfer)
         {
-            return BadRequest(new { message = "MoMo payments are updated automatically after the customer completes the hosted payment page." });
+            return BadRequest(new
+            {
+                message = "Wait for the customer to confirm the transfer before cashier review."
+            });
         }
+
+        if (payment.Booking.Status == BookingStatusNames.Completed && status != PaymentStatusNames.Paid)
+            return BadRequest(new { message = "Completed bookings cannot have their payment downgraded." });
+
+        if (payment.Status == PaymentStatusNames.Paid && status == PaymentStatusNames.Rejected)
+            return BadRequest(new { message = "Use REFUNDED instead of REJECTED after payment is already confirmed." });
 
         payment.Status = status;
+        payment.PaidAt = DateTime.UtcNow;
+        payment.Booking.PaymentStatus = status;
+        payment.Booking.UpdatedAt = DateTime.UtcNow;
 
-        if (payment.Booking != null)
+        switch (status)
         {
-            payment.Booking.PaymentStatus = status;
-            payment.Booking.UpdatedAt = DateTime.UtcNow;
-
-            if (status == "PAID")
-            {
-                payment.Booking.Status = "CONFIRMED";
-                await AutoAssignStaffAsync(payment.Booking, HttpContext.RequestAborted);
+            case PaymentStatusNames.Paid:
+                payment.Booking.Status = BookingStatusNames.Confirmed;
+                var paidResult = await _bookingStaffingService.AutoAssignAsync(payment.Booking, HttpContext.RequestAborted);
+                if (paidResult.HasIncompleteStaffing)
+                {
+                    _logger.LogInformation(
+                        "Booking {BookingCode} paid with incomplete staffing: {Warnings}",
+                        payment.Booking.BookingCode,
+                        string.Join(" | ", paidResult.Warnings));
+                }
 
                 await _emailSender.SendAsync(
                     payment.Booking.Email,
@@ -534,13 +436,10 @@ public class PaymentsController : ControllerBase
                         payment.Booking.FullName,
                         payment.Booking.BookingCode,
                         payment.PaymentCode));
-            }
-            else if (status == "REJECTED")
-            {
-                if (payment.Booking.Status == "CONFIRMED")
-                {
-                    payment.Booking.Status = "PENDING";
-                }
+                break;
+
+            case PaymentStatusNames.Rejected:
+                payment.Booking.Status = BookingStatusNames.Pending;
 
                 await _emailSender.SendAsync(
                     payment.Booking.Email,
@@ -549,14 +448,18 @@ public class PaymentsController : ControllerBase
                         payment.Booking.FullName,
                         payment.Booking.BookingCode,
                         payment.PaymentCode));
-            }
+                break;
+
+            case PaymentStatusNames.Refunded:
+                payment.Booking.Status = BookingStatusNames.Cancelled;
+                break;
         }
 
         await _db.SaveChangesAsync();
         return Ok(MapPayment(payment));
     }
 
-    [Authorize(Roles = "ADMIN")]
+    [Authorize(Roles = RoleNames.Admin)]
     [HttpDelete("{id:int}")]
     public async Task<IActionResult> Delete(int id)
     {
@@ -565,23 +468,161 @@ public class PaymentsController : ControllerBase
             .FirstOrDefaultAsync(x => x.Id == id);
 
         if (payment == null)
-        {
             return NotFound(new { message = "Payment not found" });
-        }
 
         if (payment.Booking != null)
         {
-            payment.Booking.PaymentStatus = "UNPAID";
-            if (payment.Booking.Status == "CONFIRMED")
-            {
-                payment.Booking.Status = "PENDING";
-            }
+            payment.Booking.PaymentStatus = PaymentStatusNames.Unpaid;
+            if (payment.Booking.Status == BookingStatusNames.Confirmed)
+                payment.Booking.Status = BookingStatusNames.Pending;
+
             payment.Booking.UpdatedAt = DateTime.UtcNow;
         }
 
         _db.Payments.Remove(payment);
         await _db.SaveChangesAsync();
         return NoContent();
+    }
+
+    private async Task<ActionResult<PaymentDto>> ReuseOrRefreshMomoPaymentAsync(Booking booking, Payment existingPending, CancellationToken cancellationToken)
+    {
+        var expired = existingPending.PaidAt.Add(PaymentTtl) <= DateTime.UtcNow;
+        if (expired)
+        {
+            existingPending.Status = PaymentStatusNames.Rejected;
+            booking.PaymentStatus = PaymentStatusNames.Rejected;
+            booking.Status = BookingStatusNames.Pending;
+            booking.UpdatedAt = DateTime.UtcNow;
+            await _db.SaveChangesAsync(cancellationToken);
+            return BadRequest(new { message = "The previous MoMo session expired. Please create a new payment request." });
+        }
+
+        try
+        {
+            var refreshedResponse = await CreateNewMomoPaymentAsync(booking, existingPending, cancellationToken);
+            booking.PaymentStatus = PaymentStatusNames.Pending;
+            booking.UpdatedAt = DateTime.UtcNow;
+            existingPending.PaidAt = DateTime.UtcNow;
+            await _db.SaveChangesAsync(cancellationToken);
+            return Ok(MapPayment(existingPending, refreshedResponse, _momoOptions.UseSandbox));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to recreate MoMo sandbox payment for booking {BookingCode}", booking.BookingCode);
+            return StatusCode(502, new
+            {
+                message = "Could not create the MoMo sandbox payment session.",
+                detail = ex.Message
+            });
+        }
+    }
+
+    private async Task<MomoCreatePaymentResponse> CreateNewMomoPaymentAsync(Booking booking, Payment payment, CancellationToken cancellationToken)
+    {
+        var redirectUrl = BuildPublicReturnUrl(booking, payment);
+        var ipnUrl = BuildIpnUrl();
+        var requestId = $"REQ-{payment.PaymentCode}-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}";
+        var orderId = BuildMomoOrderId(booking);
+        var extraData = BuildExtraData(booking, payment);
+
+        payment.TransactionCode = orderId;
+
+        var momoRequest = new MomoCreatePaymentRequest
+        {
+            AccessKey = _momoOptions.AccessKey,
+            PartnerCode = _momoOptions.PartnerCode,
+            RequestId = requestId,
+            Amount = Convert.ToInt64(payment.Amount),
+            OrderId = orderId,
+            OrderInfo = $"SuSpa payment for {booking.BookingCode}",
+            RedirectUrl = redirectUrl,
+            IpnUrl = ipnUrl,
+            ExtraData = extraData,
+            RequestType = "captureWallet",
+            Lang = "en",
+            PartnerName = string.IsNullOrWhiteSpace(_momoOptions.PartnerName) ? _momoOptions.StoreName : _momoOptions.PartnerName,
+            StoreId = string.IsNullOrWhiteSpace(_momoOptions.StoreId) ? "SuSpaStore" : _momoOptions.StoreId,
+            StoreName = _momoOptions.StoreName,
+            AutoCapture = true,
+            UserInfo = new
+            {
+                name = booking.FullName,
+                phoneNumber = booking.Phone,
+                email = booking.Email
+            }
+        };
+
+        var momoResponse = await _momoService.CreatePaymentAsync(momoRequest, cancellationToken);
+        if (momoResponse.ResultCode != 0 || string.IsNullOrWhiteSpace(momoResponse.PayUrl))
+        {
+            throw new InvalidOperationException(string.IsNullOrWhiteSpace(momoResponse.Message)
+                ? "MoMo could not create the payment session."
+                : momoResponse.Message);
+        }
+
+        return momoResponse;
+    }
+
+    private async Task SendCreatedPaymentEmailAsync(Booking booking, PaymentDto payment, CancellationToken cancellationToken)
+    {
+        if (payment.Method == PaymentMethodNames.BankTransfer)
+        {
+            await _emailSender.SendAsync(
+                booking.Email,
+                "SuSpa bank transfer instruction",
+                EmailTemplateService.BuildBankTransferInstructionTemplate(
+                    booking.FullName,
+                    booking.BookingCode,
+                    payment.PaymentCode,
+                    payment.ProviderName,
+                    payment.AccountNumber,
+                    payment.AccountName,
+                    payment.Amount,
+                    payment.PaymentContent,
+                    _bankTransferOptions.Instruction),
+                cancellationToken);
+            return;
+        }
+
+        await _emailSender.SendAsync(
+            booking.Email,
+            "SuSpa MoMo payment created",
+            EmailTemplateService.BuildPaymentRequestTemplate(
+                booking.FullName,
+                booking.BookingCode,
+                payment.PaymentCode,
+                payment.Method,
+                payment.Amount,
+                payment.PaymentContent),
+            cancellationToken);
+    }
+
+    private async Task NotifyCashiersAsync(Booking booking, Payment payment, CancellationToken cancellationToken)
+    {
+        var recipients = await _db.Admins
+            .AsNoTracking()
+            .Where(x => x.IsActive
+                && !string.IsNullOrWhiteSpace(x.Email)
+                && (x.Role == RoleNames.Admin || x.Role == RoleNames.Cashier))
+            .Select(x => x.Email)
+            .Distinct()
+            .ToListAsync(cancellationToken);
+
+        if (recipients.Count == 0)
+            return;
+
+        var paymentContent = $"{payment.PaymentCode} {booking.BookingCode}".Trim();
+        var body = EmailTemplateService.BuildCashierPaymentSubmittedTemplate(
+            booking.BookingCode,
+            payment.PaymentCode,
+            booking.FullName,
+            payment.Amount,
+            paymentContent);
+
+        foreach (var email in recipients)
+        {
+            await _emailSender.SendAsync(email, "SuSpa bank transfer needs cashier review", body, cancellationToken);
+        }
     }
 
     private string BuildIpnUrl()
@@ -592,9 +633,7 @@ public class PaymentsController : ControllerBase
         var ipnPath = string.IsNullOrWhiteSpace(_momoOptions.IpnPath) ? "/api/payments/momo/ipn" : _momoOptions.IpnPath;
 
         if (!ipnPath.StartsWith('/'))
-        {
             ipnPath = $"/{ipnPath}";
-        }
 
         return $"{baseUrl}{ipnPath}";
     }
@@ -606,9 +645,7 @@ public class PaymentsController : ControllerBase
         var baseUrl = string.IsNullOrWhiteSpace(configuredBaseUrl) ? requestBaseUrl : configuredBaseUrl;
         var returnPath = string.IsNullOrWhiteSpace(_momoOptions.ReturnPath) ? "/api/payments/momo/return" : _momoOptions.ReturnPath;
         if (!returnPath.StartsWith('/'))
-        {
             returnPath = $"/{returnPath}";
-        }
 
         return $"{baseUrl}{returnPath}?bookingCode={Uri.EscapeDataString(booking.BookingCode)}&paymentCode={Uri.EscapeDataString(payment.PaymentCode)}";
     }
@@ -625,15 +662,10 @@ public class PaymentsController : ControllerBase
         return Convert.ToBase64String(Encoding.UTF8.GetBytes(json));
     }
 
-    private static PaymentDto MapPayment(Payment payment, MomoCreatePaymentResponse? momo = null, bool isSandbox = false)
+    private PaymentDto MapPayment(Payment payment, MomoCreatePaymentResponse? momo = null, bool isSandbox = false)
     {
-        var providerName = "MoMo E-Wallet";
-        var accountNumber = "0901234567";
-        var accountName = "CONG TY SUSPA MOMO";
         var paymentContent = $"{payment.PaymentCode} {payment.Booking?.BookingCode ?? string.Empty}".Trim();
-        var qrNote = payment.Method == "MOMO"
-            ? "You will be redirected to the official MoMo sandbox payment page to scan the QR code."
-            : "Transfer to the bank account shown below and use the exact transfer content so admin can verify the payment.";
+        var isMomo = payment.Method == PaymentMethodNames.Momo;
 
         return new PaymentDto
         {
@@ -646,17 +678,214 @@ public class PaymentsController : ControllerBase
             Status = payment.Status,
             PaidAt = ToUtc(payment.PaidAt),
             TransactionCode = payment.TransactionCode,
-            ProviderName = providerName,
-            AccountNumber = accountNumber,
-            AccountName = accountName,
+            ProviderName = isMomo ? "MoMo E-Wallet" : _bankTransferOptions.ProviderName,
+            AccountNumber = isMomo ? "0901234567" : _bankTransferOptions.AccountNumber,
+            AccountName = isMomo ? "CONG TY SUSPA MOMO" : _bankTransferOptions.AccountName,
             PaymentContent = paymentContent,
-            QrNote = qrNote,
+            QrNote = isMomo
+                ? "You will be redirected to the official MoMo sandbox payment page to scan the QR code."
+                : _bankTransferOptions.Instruction,
             PayUrl = momo?.PayUrl,
             DeepLink = momo?.Deeplink,
             QrCodeUrl = momo?.QrCodeUrl,
-            IsSandbox = isSandbox
+            IsSandbox = isSandbox,
+            CustomerCanConfirm = payment.Method == PaymentMethodNames.BankTransfer
+                && payment.Status == PaymentStatusNames.AwaitingTransfer,
+            RequiresManualReview = payment.Method == PaymentMethodNames.BankTransfer
+                && payment.Status == PaymentStatusNames.Pending
         };
     }
+
+    private string? ValidateMomoAmount(decimal amount)
+    {
+        if (!_momoOptions.Enabled
+            || string.IsNullOrWhiteSpace(_momoOptions.PartnerCode)
+            || string.IsNullOrWhiteSpace(_momoOptions.AccessKey)
+            || string.IsNullOrWhiteSpace(_momoOptions.SecretKey))
+        {
+            return "MoMo sandbox is not configured yet. Please update appsettings.json with PartnerCode, AccessKey and SecretKey.";
+        }
+
+        if (amount is < 1000 or > 50_000_000)
+            return "MoMo requires amount between 1,000 VND and 50,000,000 VND. Please update service prices to VND.";
+
+        return null;
+    }
+
+    private string? ValidateBookingPaymentWindow(Booking booking)
+    {
+        var bangkokNow = GetBangkokNow();
+        var todayBk = DateOnly.FromDateTime(bangkokNow.Date);
+
+        if (booking.AppointmentDate < todayBk)
+            return "This booking date has passed. Payment is no longer available.";
+
+        if (booking.AppointmentDate != todayBk)
+            return null;
+
+        var appointmentMinutes = ParseTimeToMinutes(booking.AppointmentTime);
+        var nowMinutes = bangkokNow.Hour * 60 + bangkokNow.Minute;
+        if (appointmentMinutes.HasValue && appointmentMinutes.Value <= nowMinutes)
+            return "Payment closed because the appointment time has passed.";
+
+        return null;
+    }
+
+    private static bool IsActivePaymentStatus(string status) =>
+        status == PaymentStatusNames.AwaitingTransfer || status == PaymentStatusNames.Pending;
+
+    private async Task TryApplySandboxReturnFallbackAsync(
+        string? bookingCode,
+        string? paymentCode,
+        string? resultCode,
+        string? orderId,
+        string? transId,
+        CancellationToken cancellationToken)
+    {
+        if (!CanUseSandboxReturnFallback())
+            return;
+
+        if (!string.Equals(resultCode, "0", StringComparison.Ordinal))
+            return;
+
+        if (string.IsNullOrWhiteSpace(paymentCode) || string.IsNullOrWhiteSpace(bookingCode))
+            return;
+
+        var payment = await _db.Payments
+            .Include(x => x.Booking)
+            .FirstOrDefaultAsync(
+                x => x.Method == PaymentMethodNames.Momo
+                    && x.PaymentCode == paymentCode
+                    && x.Booking != null
+                    && x.Booking.BookingCode == bookingCode,
+                cancellationToken);
+
+        if (payment?.Booking == null)
+            return;
+
+        if (payment.Status == PaymentStatusNames.Paid)
+            return;
+
+        if (payment.Status != PaymentStatusNames.Pending)
+            return;
+
+        if (!string.IsNullOrWhiteSpace(orderId)
+            && !string.IsNullOrWhiteSpace(payment.TransactionCode)
+            && !payment.TransactionCode.StartsWith(orderId, StringComparison.Ordinal))
+        {
+            _logger.LogWarning(
+                "Skipped MoMo return fallback because order id {OrderId} does not match payment {PaymentCode}",
+                orderId,
+                payment.PaymentCode);
+            return;
+        }
+
+        _logger.LogInformation(
+            "Applying sandbox MoMo return fallback for booking {BookingCode} payment {PaymentCode}",
+            bookingCode,
+            paymentCode);
+
+        await ApplySuccessfulPaymentAsync(payment, orderId, transId, cancellationToken);
+        await _db.SaveChangesAsync(cancellationToken);
+    }
+
+    private bool CanUseSandboxReturnFallback()
+    {
+        if (!_momoOptions.UseSandbox)
+            return false;
+
+        if (!string.IsNullOrWhiteSpace(_momoOptions.PublicBaseUrl))
+            return false;
+
+        var host = Request.Host.Host?.Trim().ToLowerInvariant() ?? string.Empty;
+        return host is "localhost" or "127.0.0.1";
+    }
+
+    private async Task ApplySuccessfulPaymentAsync(
+        Payment payment,
+        string? orderId,
+        string? transId,
+        CancellationToken cancellationToken)
+    {
+        if (payment.Booking == null)
+            return;
+
+        payment.TransactionCode = !string.IsNullOrWhiteSpace(transId)
+            ? $"{orderId}|{transId}"
+            : orderId ?? payment.TransactionCode;
+        payment.PaidAt = DateTime.UtcNow;
+        payment.Status = PaymentStatusNames.Paid;
+        payment.Booking.PaymentStatus = PaymentStatusNames.Paid;
+        payment.Booking.Status = BookingStatusNames.Confirmed;
+        payment.Booking.UpdatedAt = DateTime.UtcNow;
+
+        var staffingResult = await _bookingStaffingService.AutoAssignAsync(payment.Booking, cancellationToken);
+        if (staffingResult.HasIncompleteStaffing)
+        {
+            _logger.LogInformation(
+                "Booking {BookingCode} confirmed through payment with incomplete staffing: {Warnings}",
+                payment.Booking.BookingCode,
+                string.Join(" | ", staffingResult.Warnings));
+        }
+
+        await _emailSender.SendAsync(
+            payment.Booking.Email,
+            "SuSpa payment confirmed",
+            EmailTemplateService.BuildPaymentConfirmedTemplate(
+                payment.Booking.FullName,
+                payment.Booking.BookingCode,
+                payment.PaymentCode),
+            cancellationToken);
+    }
+
+    private async Task ApplyRejectedPaymentAsync(
+        Payment payment,
+        string bookingStatus,
+        CancellationToken cancellationToken)
+    {
+        if (payment.Booking == null)
+            return;
+
+        payment.Status = PaymentStatusNames.Rejected;
+        payment.Booking.PaymentStatus = PaymentStatusNames.Rejected;
+        payment.Booking.Status = bookingStatus;
+        payment.Booking.UpdatedAt = DateTime.UtcNow;
+
+        await _emailSender.SendAsync(
+            payment.Booking.Email,
+            "SuSpa payment rejected",
+            EmailTemplateService.BuildPaymentRejectedTemplate(
+                payment.Booking.FullName,
+                payment.Booking.BookingCode,
+                payment.PaymentCode),
+            cancellationToken);
+    }
+
+    private bool CanAccessPayment(Booking? booking) =>
+        booking != null && CanAccessBooking(booking);
+
+    private bool CanAccessBooking(Booking booking)
+    {
+        var role = User.FindFirstValue(ClaimTypes.Role) ?? string.Empty;
+        if (role == RoleNames.Admin || role == RoleNames.Cashier)
+            return true;
+
+        var currentEmail = GetCurrentEmail();
+        return !string.IsNullOrWhiteSpace(currentEmail)
+            && string.Equals(booking.Email.Trim(), currentEmail, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private string GetCurrentEmail() =>
+        User.FindFirstValue(ClaimTypes.Email)?.Trim().ToLowerInvariant() ?? string.Empty;
+
+    private static string NormalizeMethod(string? method) =>
+        (method ?? string.Empty).Trim().ToUpperInvariant();
+
+    private static string NormalizeStatus(string? status) =>
+        (status ?? string.Empty).Trim().ToUpperInvariant();
+
+    private static string BuildMomoOrderId(Booking booking) =>
+        $"MOMO-{booking.BookingCode}-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}";
 
     private static DateTime ToUtc(DateTime value)
     {
@@ -673,132 +902,19 @@ public class PaymentsController : ControllerBase
         }
         catch
         {
-            return DateTime.UtcNow.AddHours(7); // fallback UTC+7
+            return DateTime.UtcNow.AddHours(7);
         }
-    }
-
-    private async Task AutoAssignStaffAsync(Booking booking, CancellationToken cancellationToken)
-    {
-        await _db.Entry(booking)
-            .Collection(b => b.BookingDetails)
-            .Query()
-            .Include(d => d.Service)
-            .LoadAsync(cancellationToken);
-
-        var pendingDetails = booking.BookingDetails
-            .Where(d => d.StaffId == null && d.Service != null)
-            .ToList();
-
-        if (pendingDetails.Count == 0) return;
-
-        var appointmentDates = pendingDetails.Select(d => d.AppointmentDate).Distinct().ToList();
-        var categoryIds = pendingDetails.Select(d => d.Service!.CategoryId).Distinct().ToList();
-
-        var staffPool = await _db.Staffs
-            .AsNoTracking()
-            .Include(s => s.StaffCategories)
-            .Where(s => s.IsActive && s.StaffCategories.Any(sc => categoryIds.Contains(sc.CategoryId)))
-            .ToListAsync(cancellationToken);
-
-        if (staffPool.Count == 0)
-        {
-            _logger.LogInformation("Auto-assign skipped: no active staff matching categories {Categories}", string.Join(',', categoryIds));
-            return;
-        }
-
-        var assignedDetails = await _db.BookingDetails
-            .AsNoTracking()
-            .Include(d => d.Service)
-            .Include(d => d.Booking)
-            .Where(d => d.StaffId != null
-                && appointmentDates.Contains(d.AppointmentDate)
-                && d.Booking != null
-                && d.Booking.Status != "CANCELLED")
-            .ToListAsync(cancellationToken);
-
-        var newAssignments = new List<BookingDetail>();
-
-        foreach (var detail in pendingDetails)
-        {
-            var start = ParseTimeToMinutes(detail.AppointmentTime);
-            if (start == null || detail.Service == null) continue;
-
-            var duration = detail.Service.Duration;
-            var end = start.Value + Math.Max(1, duration);
-
-            var candidates = staffPool
-                .Where(s => s.StaffCategories.Any(sc => sc.CategoryId == detail.Service.CategoryId))
-                .ToList();
-
-            Staff? chosen = null;
-            int? chosenLoad = null;
-
-            foreach (var staff in candidates)
-            {
-                var overlapCount = assignedDetails
-                    .Where(x => x.StaffId == staff.Id && x.AppointmentDate == detail.AppointmentDate)
-                    .Count(x =>
-                    {
-                        var s = ParseTimeToMinutes(x.AppointmentTime);
-                        if (s == null) return false;
-                        var e = s.Value + Math.Max(1, (x.Service?.Duration ?? duration));
-                        return s.Value < end && start.Value < e;
-                    });
-
-                overlapCount += newAssignments
-                    .Where(x => x.StaffId == staff.Id && x.AppointmentDate == detail.AppointmentDate)
-                    .Count(x =>
-                    {
-                        var s = ParseTimeToMinutes(x.AppointmentTime);
-                        if (s == null) return false;
-                        var e = s.Value + Math.Max(1, (x.Service?.Duration ?? duration));
-                        return s.Value < end && start.Value < e;
-                    });
-
-                if (overlapCount < staff.MaxConcurrent)
-                {
-                    if (chosen == null || overlapCount < chosenLoad || (overlapCount == chosenLoad && staff.Id < chosen.Id))
-                    {
-                        chosen = staff;
-                        chosenLoad = overlapCount;
-                    }
-                }
-            }
-
-            if (chosen != null)
-            {
-                detail.StaffId = chosen.Id;
-                newAssignments.Add(detail);
-                assignedDetails.Add(detail);
-            }
-            else
-            {
-                _logger.LogInformation(
-                    "Auto-assign could not find available staff for booking {BookingCode} detail {DetailId} at {Date} {Time}, category {CategoryId}",
-                    booking.BookingCode,
-                    detail.Id,
-                    detail.AppointmentDate,
-                    detail.AppointmentTime,
-                    detail.Service.CategoryId);
-            }
-        }
-
-        booking.UpdatedAt = DateTime.UtcNow;
     }
 
     private static int? ParseTimeToMinutes(string? value)
     {
         if (string.IsNullOrWhiteSpace(value)) return null;
         if (DateTime.TryParse(value, out var dt))
-        {
             return dt.Hour * 60 + dt.Minute;
-        }
 
         var parts = value.Split(':');
         if (parts.Length >= 2 && int.TryParse(parts[0], out var h) && int.TryParse(parts[1].Substring(0, 2), out var m))
-        {
             return (h % 24) * 60 + Math.Clamp(m, 0, 59);
-        }
 
         return null;
     }

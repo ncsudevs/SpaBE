@@ -4,6 +4,7 @@ using Microsoft.EntityFrameworkCore;
 using SpaBookingSystem.Api.Dtos.Staff;
 using SpaBookingSystem.Api.Helpers;
 using SpaBookingSystem.ApplicationCore.Entities;
+using SpaBookingSystem.ApplicationCore.Constants;
 using SpaBookingSystem.DataLayer;
 using SpaBookingSystem.Api.Dtos;
 
@@ -20,7 +21,7 @@ public class StaffController : ControllerBase
         _db = db;
     }
 
-    [Authorize(Roles = "ADMIN")]
+    [Authorize(Roles = $"{RoleNames.Admin},{RoleNames.Cashier}")]
     [HttpGet]
     public async Task<ActionResult<List<StaffDto>>> GetAll()
     {
@@ -35,7 +36,7 @@ public class StaffController : ControllerBase
         return Ok(data.Select(Map));
     }
 
-    [Authorize(Roles = "ADMIN")]
+    [Authorize(Roles = $"{RoleNames.Admin},{RoleNames.Cashier}")]
     [HttpGet("{id:int}")]
     public async Task<ActionResult<StaffDto>> GetById(int id)
     {
@@ -48,42 +49,47 @@ public class StaffController : ControllerBase
         return Ok(Map(entity));
     }
 
-    [Authorize(Roles = "ADMIN")]
+    [Authorize(Roles = $"{RoleNames.Admin},{RoleNames.Cashier}")]
     [HttpGet("{id:int}/schedule")]
     public async Task<ActionResult<List<StaffScheduleDto>>> GetSchedule(int id, [FromQuery] DateOnly? date)
     {
         var staffExists = await _db.Staffs.AsNoTracking().AnyAsync(x => x.Id == id);
         if (!staffExists) return NotFound(new { message = "Staff not found" });
 
-        var query = _db.BookingDetails
+        var query = _db.BookingDetailStaffAssignments
             .AsNoTracking()
-            .Include(d => d.Service)
-            .Include(d => d.Booking)
-            .Where(d => d.StaffId == id && d.Booking != null && d.Booking.Status != "CANCELLED");
+            .Include(a => a.BookingDetail)
+                .ThenInclude(d => d!.Service)
+            .Include(a => a.BookingDetail)
+                .ThenInclude(d => d!.Booking)
+            .Where(a => a.StaffId == id
+                && a.BookingDetail != null
+                && a.BookingDetail.Booking != null
+                && a.BookingDetail.Booking.Status != "CANCELLED");
 
         if (date.HasValue)
         {
-            query = query.Where(d => d.AppointmentDate == date.Value);
+            query = query.Where(a => a.BookingDetail!.AppointmentDate == date.Value);
         }
 
         var data = await query
-            .OrderBy(d => d.AppointmentDate)
-            .ThenBy(d => d.AppointmentTime)
+            .OrderBy(a => a.BookingDetail!.AppointmentDate)
+            .ThenBy(a => a.BookingDetail!.AppointmentTime)
             .ToListAsync();
 
-        var schedule = data.Select(d => new StaffScheduleDto
+        var schedule = data.Select(a => new StaffScheduleDto
         {
-            BookingDetailId = d.Id,
-            BookingId = d.BookingId,
-            BookingCode = d.Booking?.BookingCode ?? string.Empty,
-            AppointmentDate = d.AppointmentDate,
-            AppointmentTime = d.AppointmentTime ?? string.Empty,
-            ServiceName = d.Service?.Name ?? string.Empty,
-            Duration = d.Service?.Duration ?? 0,
-            Quantity = d.Quantity,
-            CustomerName = d.Booking?.FullName ?? string.Empty,
-            CustomerEmail = d.Booking?.Email ?? string.Empty,
-            Status = d.Booking?.Status ?? string.Empty
+            BookingDetailId = a.BookingDetailId,
+            BookingId = a.BookingDetail?.BookingId ?? 0,
+            BookingCode = a.BookingDetail?.Booking?.BookingCode ?? string.Empty,
+            AppointmentDate = a.BookingDetail?.AppointmentDate ?? default,
+            AppointmentTime = a.BookingDetail?.AppointmentTime ?? string.Empty,
+            ServiceName = a.BookingDetail?.Service?.Name ?? string.Empty,
+            Duration = a.BookingDetail?.Service?.Duration ?? 0,
+            Quantity = a.AssignedQuantity,
+            CustomerName = a.BookingDetail?.Booking?.FullName ?? string.Empty,
+            CustomerEmail = a.BookingDetail?.Booking?.Email ?? string.Empty,
+            Status = a.BookingDetail?.Booking?.Status ?? string.Empty
         }).ToList();
 
         return Ok(schedule);
@@ -147,7 +153,7 @@ public class StaffController : ControllerBase
         var entity = await _db.Staffs.FirstOrDefaultAsync(x => x.Id == id);
         if (entity == null) return NotFound(new { message = "Staff not found" });
 
-        var inUse = await _db.BookingDetails.AnyAsync(x => x.StaffId == id);
+        var inUse = await _db.BookingDetailStaffAssignments.AnyAsync(x => x.StaffId == id);
         if (inUse) return Conflict(new { message = "Cannot delete: staff is already assigned to bookings." });
 
         _db.Staffs.Remove(entity);
