@@ -1,4 +1,4 @@
-namespace SpaBookingSystem.Api.Models.Auth;
+namespace SpaBookingSystem.Services.Auth;
 
 public class TokenUser
 {

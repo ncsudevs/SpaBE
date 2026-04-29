@@ -7,7 +7,7 @@ using SpaBookingSystem.ApplicationCore.Entities;
 using SpaBookingSystem.DataLayer;
 using System.Security.Claims;
 using SpaBookingSystem.Api.Helpers;
-using SpaBookingSystem.Api.Services;
+using SpaBookingSystem.Services.Bookings;
 
 namespace SpaBookingSystem.Api.Controllers;
 
@@ -25,11 +25,16 @@ public class BookingsController : ControllerBase
 
     private readonly SpaDbContext _db;
     private readonly IBookingStaffingService _bookingStaffingService;
+    private readonly IBookingStatusService _bookingStatusService;
 
-    public BookingsController(SpaDbContext db, IBookingStaffingService bookingStaffingService)
+    public BookingsController(
+        SpaDbContext db,
+        IBookingStaffingService bookingStaffingService,
+        IBookingStatusService bookingStatusService)
     {
         _db = db;
         _bookingStaffingService = bookingStaffingService;
+        _bookingStatusService = bookingStatusService;
     }
 
     [Authorize]
@@ -289,56 +294,14 @@ public class BookingsController : ControllerBase
         if (booking == null)
             return NotFound(new { message = "Booking not found" });
 
-        if (booking.Status == BookingStatusNames.Cancelled && status != BookingStatusNames.Cancelled)
-            return BadRequest(new { message = "Cancelled bookings are final and cannot be reopened." });
+        var validationMessage = _bookingStatusService.ValidateAdminStatusChange(
+            booking,
+            status,
+            _bookingStaffingService.IsFullyStaffed(booking));
+        if (!string.IsNullOrWhiteSpace(validationMessage))
+            return BadRequest(new { message = validationMessage });
 
-        switch (status)
-        {
-            case BookingStatusNames.Pending:
-                if (booking.PaymentStatus == PaymentStatusNames.Paid)
-                    return BadRequest(new { message = "Paid bookings cannot be moved back to PENDING." });
-
-                ResetCheckIn(booking);
-                break;
-
-            case BookingStatusNames.Confirmed:
-                if (booking.PaymentStatus != PaymentStatusNames.Paid)
-                    return BadRequest(new { message = "Only paid bookings can be confirmed." });
-
-                if (booking.Status == BookingStatusNames.Completed)
-                    return BadRequest(new { message = "Completed bookings cannot be moved back to CONFIRMED." });
-                break;
-
-            case BookingStatusNames.Completed:
-                if (booking.PaymentStatus != PaymentStatusNames.Paid)
-                    return BadRequest(new { message = "Check-in can only be completed after payment is confirmed." });
-
-                if (booking.Status != BookingStatusNames.Confirmed && booking.Status != BookingStatusNames.Completed)
-                    return BadRequest(new { message = "Booking must be confirmed before it can be completed." });
-
-                if (!booking.IsCheckedIn)
-                    return BadRequest(new { message = "Booking must be checked in before it can be completed." });
-
-                if (!_bookingStaffingService.IsFullyStaffed(booking))
-                    return BadRequest(new { message = "Assign enough staff quantity to every booking item before completing check-in." });
-                break;
-
-            case BookingStatusNames.Cancelled:
-                if (booking.Status == BookingStatusNames.Completed)
-                    return BadRequest(new { message = "Completed bookings cannot be cancelled." });
-
-                if (booking.IsCheckedIn)
-                    return BadRequest(new { message = "Undo check-in before cancelling this booking." });
-
-                if (booking.PaymentStatus == PaymentStatusNames.Paid)
-                    return BadRequest(new { message = "Paid bookings must be refunded from the payments screen so a refund reason can be recorded." });
-
-                ResetCheckIn(booking);
-                break;
-        }
-
-        booking.Status = status;
-        booking.UpdatedAt = DateTime.UtcNow;
+        _bookingStatusService.ApplyAdminStatusChange(booking, status);
 
         await _db.SaveChangesAsync();
         return Ok(MapBooking(booking));
@@ -361,25 +324,11 @@ public class BookingsController : ControllerBase
         if (booking == null)
             return NotFound(new { message = "Booking not found" });
 
-        if (booking.PaymentStatus != PaymentStatusNames.Paid)
-            return Conflict(new { message = "Only paid bookings can be checked in." });
+        var validationMessage = _bookingStatusService.ValidateCheckInChange(booking, dto.IsCheckedIn);
+        if (!string.IsNullOrWhiteSpace(validationMessage))
+            return Conflict(new { message = validationMessage });
 
-        if (booking.Status == BookingStatusNames.Cancelled)
-            return Conflict(new { message = "Cancelled bookings cannot be checked in." });
-
-        if (dto.IsCheckedIn)
-        {
-            if (booking.Status != BookingStatusNames.Confirmed)
-                return Conflict(new { message = "Only confirmed bookings can be checked in." });
-        }
-        else if (booking.Status == BookingStatusNames.Completed)
-        {
-            return Conflict(new { message = "Completed bookings cannot be unchecked." });
-        }
-
-        booking.IsCheckedIn = dto.IsCheckedIn;
-        booking.CheckedInAt = dto.IsCheckedIn ? DateTime.UtcNow : null;
-        booking.UpdatedAt = DateTime.UtcNow;
+        _bookingStatusService.SetCheckIn(booking, dto.IsCheckedIn);
 
         await _db.SaveChangesAsync();
         return Ok(MapBooking(booking));
@@ -631,7 +580,7 @@ public class BookingsController : ControllerBase
 
     private BookingDto MapBooking(Booking booking)
     {
-        var effectiveCheckedIn = IsEffectiveCheckedIn(booking);
+        var effectiveCheckedIn = _bookingStatusService.IsEffectiveCheckedIn(booking);
         var firstSlot = booking.BookingDetails.OrderBy(x => x.AppointmentDate).ThenBy(x => x.AppointmentTime).FirstOrDefault();
         var latestPayment = booking.Payments?
             .OrderByDescending(p => p.PaidAt)
@@ -650,8 +599,8 @@ public class BookingsController : ControllerBase
             Note = booking.Note,
             TotalAmount = booking.TotalAmount,
             Status = booking.Status,
-            WorkflowStatus = GetWorkflowStatus(booking),
-            WorkflowStatusLabel = GetWorkflowStatusLabel(booking),
+            WorkflowStatus = _bookingStatusService.GetWorkflowStatus(booking),
+            WorkflowStatusLabel = _bookingStatusService.GetWorkflowStatusLabel(booking),
             PaymentStatus = booking.PaymentStatus,
             IsGroupBooking = booking.IsGroupBooking,
             GroupSize = booking.GroupSize,
@@ -704,42 +653,6 @@ public class BookingsController : ControllerBase
         if (value.Kind == DateTimeKind.Utc) return value;
         return DateTime.SpecifyKind(value, DateTimeKind.Utc);
     }
-
-    private static void ResetCheckIn(Booking booking)
-    {
-        booking.IsCheckedIn = false;
-        booking.CheckedInAt = null;
-    }
-
-    private static string GetWorkflowStatus(Booking booking)
-    {
-        if (booking.Status == BookingStatusNames.Cancelled)
-            return BookingStatusNames.Cancelled;
-
-        if (booking.Status == BookingStatusNames.Completed)
-            return BookingStatusNames.Completed;
-
-        if (IsEffectiveCheckedIn(booking))
-            return "CHECKED_IN";
-
-        return booking.Status;
-    }
-
-    private static bool IsEffectiveCheckedIn(Booking booking) =>
-        booking.IsCheckedIn
-        && booking.Status == BookingStatusNames.Confirmed
-        && booking.PaymentStatus == PaymentStatusNames.Paid;
-
-    private static string GetWorkflowStatusLabel(Booking booking) =>
-        GetWorkflowStatus(booking) switch
-        {
-            "CHECKED_IN" => "Checked in",
-            BookingStatusNames.Pending => "Waiting processing",
-            BookingStatusNames.Confirmed => "Paid and scheduled",
-            BookingStatusNames.Completed => "Service completed",
-            BookingStatusNames.Cancelled => "Cancelled",
-            var other => other
-        };
 
     private static DateTime GetBangkokNow()
     {

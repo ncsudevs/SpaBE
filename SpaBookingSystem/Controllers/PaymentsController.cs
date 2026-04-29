@@ -7,12 +7,13 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using SpaBookingSystem.Api.Dtos.Payments;
 using SpaBookingSystem.Api.Options;
-using SpaBookingSystem.Api.Services.Email;
-using SpaBookingSystem.Api.Services.Momo;
-using SpaBookingSystem.Api.Services;
 using SpaBookingSystem.ApplicationCore.Constants;
 using SpaBookingSystem.ApplicationCore.Entities;
 using SpaBookingSystem.DataLayer;
+using SpaBookingSystem.Services.Bookings;
+using SpaBookingSystem.Services.Email;
+using SpaBookingSystem.Services.Momo;
+using SpaBookingSystem.Services.Options;
 
 namespace SpaBookingSystem.Api.Controllers;
 
@@ -28,15 +29,13 @@ public class PaymentsController : ControllerBase
         PaymentStatusNames.Rejected
     ];
 
-    private static readonly TimeSpan PaymentTtl = TimeSpan.FromMinutes(5);
-    private const int MaxPaymentAttempts = 3;
-
     private readonly SpaDbContext _db;
     private readonly IEmailSender _emailSender;
     private readonly IMomoService _momoService;
     private readonly MomoOptions _momoOptions;
     private readonly BankTransferOptions _bankTransferOptions;
     private readonly IBookingStaffingService _bookingStaffingService;
+    private readonly IBookingStatusService _bookingStatusService;
     private readonly ILogger<PaymentsController> _logger;
 
     public PaymentsController(
@@ -46,6 +45,7 @@ public class PaymentsController : ControllerBase
         IOptions<MomoOptions> momoOptions,
         IOptions<BankTransferOptions> bankTransferOptions,
         IBookingStaffingService bookingStaffingService,
+        IBookingStatusService bookingStatusService,
         ILogger<PaymentsController> logger)
     {
         _db = db;
@@ -54,6 +54,7 @@ public class PaymentsController : ControllerBase
         _momoOptions = momoOptions.Value;
         _bankTransferOptions = bankTransferOptions.Value;
         _bookingStaffingService = bookingStaffingService;
+        _bookingStatusService = bookingStatusService;
         _logger = logger;
     }
 
@@ -165,7 +166,7 @@ public class PaymentsController : ControllerBase
                 latestActivePayment.PaidAt = DateTime.UtcNow;
                 booking.PaymentStatus = PaymentStatusNames.Rejected;
                 booking.Status = BookingStatusNames.Pending;
-                ResetCheckIn(booking);
+                _bookingStatusService.ResetCheckIn(booking);
                 booking.UpdatedAt = DateTime.UtcNow;
             }
             else
@@ -173,9 +174,6 @@ public class PaymentsController : ControllerBase
                 return BadRequest(new { message = "This booking already has an active payment request." });
             }
         }
-
-        if (method == PaymentMethodNames.Momo && booking.PaymentAttempts >= MaxPaymentAttempts)
-            return BadRequest(new { message = "Payment retry limit reached for this booking." });
 
         var paymentCode = $"PAY-{DateTime.UtcNow:yyyyMMddHHmmssfff}";
         var payment = new Payment
@@ -199,7 +197,6 @@ public class PaymentsController : ControllerBase
 
         if (method == PaymentMethodNames.Momo)
         {
-            booking.PaymentAttempts += 1;
             var momoValidationError = ValidateMomoAmount(payment.Amount);
             if (momoValidationError is not null)
                 return BadRequest(new { message = momoValidationError });
@@ -264,20 +261,21 @@ public class PaymentsController : ControllerBase
         payment.PaidAt = DateTime.UtcNow;
         payment.Booking.PaymentStatus = PaymentStatusNames.Pending;
         payment.Booking.Status = BookingStatusNames.Pending;
-        ResetCheckIn(payment.Booking);
+        _bookingStatusService.ResetCheckIn(payment.Booking);
         payment.Booking.UpdatedAt = DateTime.UtcNow;
 
         await _db.SaveChangesAsync(cancellationToken);
 
         await NotifyCashiersAsync(payment.Booking, payment, cancellationToken);
-        await _emailSender.SendAsync(
+        await TrySendEmailAsync(
             payment.Booking.Email,
             "SuSpa transfer confirmation received",
             EmailTemplateService.BuildBankTransferSubmittedTemplate(
                 payment.Booking.FullName,
                 payment.Booking.BookingCode,
                 payment.PaymentCode),
-            cancellationToken);
+            cancellationToken,
+            $"sending transfer confirmation email for booking {payment.Booking.BookingCode}");
 
         return Ok(MapPayment(payment));
     }
@@ -350,19 +348,6 @@ public class PaymentsController : ControllerBase
 
         if (payment.Booking == null)
             return NoContent();
-
-        var expired = payment.PaidAt.Add(PaymentTtl) <= DateTime.UtcNow;
-        if (expired)
-        {
-            payment.Status = PaymentStatusNames.Rejected;
-            payment.Booking.PaymentStatus = PaymentStatusNames.Rejected;
-            payment.Booking.Status = BookingStatusNames.Pending;
-            ResetCheckIn(payment.Booking);
-            payment.Booking.UpdatedAt = DateTime.UtcNow;
-            await _db.SaveChangesAsync(cancellationToken);
-            _logger.LogInformation("Ignored MoMo IPN because session expired for order {OrderId}", request.OrderId);
-            return NoContent();
-        }
 
         if (payment.Amount != request.Amount || !string.Equals(request.PartnerCode, _momoOptions.PartnerCode, StringComparison.Ordinal))
         {
@@ -442,26 +427,30 @@ public class PaymentsController : ControllerBase
                         string.Join(" | ", paidResult.Warnings));
                 }
 
-                await _emailSender.SendAsync(
+                await TrySendEmailAsync(
                     payment.Booking.Email,
                     "SuSpa payment confirmed",
                     EmailTemplateService.BuildPaymentConfirmedTemplate(
                         payment.Booking.FullName,
                         payment.Booking.BookingCode,
-                        payment.PaymentCode));
+                        payment.PaymentCode),
+                    CancellationToken.None,
+                    $"sending payment confirmed email for booking {payment.Booking.BookingCode}");
                 break;
 
             case PaymentStatusNames.Rejected:
                 payment.Booking.Status = BookingStatusNames.Pending;
-                ResetCheckIn(payment.Booking);
+                _bookingStatusService.ResetCheckIn(payment.Booking);
 
-                await _emailSender.SendAsync(
+                await TrySendEmailAsync(
                     payment.Booking.Email,
                     "SuSpa payment rejected",
                     EmailTemplateService.BuildPaymentRejectedTemplate(
                         payment.Booking.FullName,
                         payment.Booking.BookingCode,
-                        payment.PaymentCode));
+                        payment.PaymentCode),
+                    CancellationToken.None,
+                    $"sending payment rejected email for booking {payment.Booking.BookingCode}");
                 break;
         }
 
@@ -495,7 +484,7 @@ public class PaymentsController : ControllerBase
         payment.PaidAt = DateTime.UtcNow;
         payment.Booking.PaymentStatus = PaymentStatusNames.Refunded;
         payment.Booking.Status = BookingStatusNames.Cancelled;
-        ResetCheckIn(payment.Booking);
+        _bookingStatusService.ResetCheckIn(payment.Booking);
         payment.Booking.UpdatedAt = DateTime.UtcNow;
 
         await _db.SaveChangesAsync();
@@ -518,7 +507,7 @@ public class PaymentsController : ControllerBase
             payment.Booking.PaymentStatus = PaymentStatusNames.Unpaid;
             if (payment.Booking.Status == BookingStatusNames.Confirmed)
                 payment.Booking.Status = BookingStatusNames.Pending;
-            ResetCheckIn(payment.Booking);
+            _bookingStatusService.ResetCheckIn(payment.Booking);
 
             payment.Booking.UpdatedAt = DateTime.UtcNow;
         }
@@ -530,18 +519,6 @@ public class PaymentsController : ControllerBase
 
     private async Task<ActionResult<PaymentDto>> ReuseOrRefreshMomoPaymentAsync(Booking booking, Payment existingPending, CancellationToken cancellationToken)
     {
-        var expired = existingPending.PaidAt.Add(PaymentTtl) <= DateTime.UtcNow;
-        if (expired)
-        {
-            existingPending.Status = PaymentStatusNames.Rejected;
-            booking.PaymentStatus = PaymentStatusNames.Rejected;
-            booking.Status = BookingStatusNames.Pending;
-            ResetCheckIn(booking);
-            booking.UpdatedAt = DateTime.UtcNow;
-            await _db.SaveChangesAsync(cancellationToken);
-            return BadRequest(new { message = "The previous MoMo session expired. Please create a new payment request." });
-        }
-
         try
         {
             var refreshedResponse = await CreateNewMomoPaymentAsync(booking, existingPending, cancellationToken);
@@ -612,7 +589,7 @@ public class PaymentsController : ControllerBase
     {
         if (payment.Method == PaymentMethodNames.BankTransfer)
         {
-            await _emailSender.SendAsync(
+            await TrySendEmailAsync(
                 booking.Email,
                 "SuSpa bank transfer instruction",
                 EmailTemplateService.BuildBankTransferInstructionTemplate(
@@ -625,11 +602,12 @@ public class PaymentsController : ControllerBase
                     payment.Amount,
                     payment.PaymentContent,
                     _bankTransferOptions.Instruction),
-                cancellationToken);
+                cancellationToken,
+                $"sending bank transfer instruction for booking {booking.BookingCode}");
             return;
         }
 
-        await _emailSender.SendAsync(
+        await TrySendEmailAsync(
             booking.Email,
             "SuSpa MoMo payment created",
             EmailTemplateService.BuildPaymentRequestTemplate(
@@ -639,7 +617,8 @@ public class PaymentsController : ControllerBase
                 payment.Method,
                 payment.Amount,
                 payment.PaymentContent),
-            cancellationToken);
+            cancellationToken,
+            $"sending MoMo payment email for booking {booking.BookingCode}");
     }
 
     private async Task NotifyCashiersAsync(Booking booking, Payment payment, CancellationToken cancellationToken)
@@ -666,7 +645,12 @@ public class PaymentsController : ControllerBase
 
         foreach (var email in recipients)
         {
-            await _emailSender.SendAsync(email, "SuSpa bank transfer needs cashier review", body, cancellationToken);
+            await TrySendEmailAsync(
+                email,
+                "SuSpa bank transfer needs cashier review",
+                body,
+                cancellationToken,
+                $"notifying cashier {email} about payment {payment.PaymentCode}");
         }
     }
 
@@ -882,14 +866,15 @@ public class PaymentsController : ControllerBase
                 string.Join(" | ", staffingResult.Warnings));
         }
 
-        await _emailSender.SendAsync(
+        await TrySendEmailAsync(
             payment.Booking.Email,
             "SuSpa payment confirmed",
             EmailTemplateService.BuildPaymentConfirmedTemplate(
                 payment.Booking.FullName,
                 payment.Booking.BookingCode,
                 payment.PaymentCode),
-            cancellationToken);
+            cancellationToken,
+            $"sending successful MoMo payment email for booking {payment.Booking.BookingCode}");
     }
 
     private async Task ApplyRejectedPaymentAsync(
@@ -903,17 +888,37 @@ public class PaymentsController : ControllerBase
         payment.Status = PaymentStatusNames.Rejected;
         payment.Booking.PaymentStatus = PaymentStatusNames.Rejected;
         payment.Booking.Status = bookingStatus;
-        ResetCheckIn(payment.Booking);
+        _bookingStatusService.ResetCheckIn(payment.Booking);
         payment.Booking.UpdatedAt = DateTime.UtcNow;
 
-        await _emailSender.SendAsync(
+        await TrySendEmailAsync(
             payment.Booking.Email,
             "SuSpa payment rejected",
             EmailTemplateService.BuildPaymentRejectedTemplate(
                 payment.Booking.FullName,
                 payment.Booking.BookingCode,
                 payment.PaymentCode),
-            cancellationToken);
+            cancellationToken,
+            $"sending rejected payment email for booking {payment.Booking.BookingCode}");
+    }
+
+    private async Task<bool> TrySendEmailAsync(
+        string toEmail,
+        string subject,
+        string htmlBody,
+        CancellationToken cancellationToken,
+        string operation)
+    {
+        try
+        {
+            await _emailSender.SendAsync(toEmail, subject, htmlBody, cancellationToken);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Email send failed while {Operation}", operation);
+            return false;
+        }
     }
 
     private bool CanAccessPayment(Booking? booking) =>
@@ -946,12 +951,6 @@ public class PaymentsController : ControllerBase
     {
         if (value.Kind == DateTimeKind.Utc) return value;
         return DateTime.SpecifyKind(value, DateTimeKind.Utc);
-    }
-
-    private static void ResetCheckIn(Booking booking)
-    {
-        booking.IsCheckedIn = false;
-        booking.CheckedInAt = null;
     }
 
     private static DateTime GetBangkokNow()

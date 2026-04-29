@@ -366,4 +366,4 @@ FodyWeavers.xsd
 /SpaBookingSystem/appsettings.*.Local.json
 
 # Secrets and email pickup (dev-only generated emails)
-/SpaBookingSystem/wwwroot/email-pickup/
+/SpaBookingSystem/App_Data/email-pickup/

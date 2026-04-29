@@ -1,8 +1,10 @@
-using Microsoft.Extensions.Options;
-using SpaBookingSystem.Api.Options;
 using System.Text;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using SpaBookingSystem.Services.Options;
 
-namespace SpaBookingSystem.Api.Services.Email;
+namespace SpaBookingSystem.Services.Email;
 
 public class FileEmailSender : IEmailSender
 {

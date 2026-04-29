@@ -1,4 +1,4 @@
-namespace SpaBookingSystem.Api.Services.Email;
+namespace SpaBookingSystem.Services.Email;
 
 public static class EmailTemplateService
 {

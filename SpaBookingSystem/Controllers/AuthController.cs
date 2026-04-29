@@ -2,14 +2,13 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using SpaBookingSystem.Api.Dtos.Auth;
-using SpaBookingSystem.Api.Models.Auth;
-using SpaBookingSystem.Api.Services;
 using SpaBookingSystem.Services;
+using SpaBookingSystem.Services.Auth;
+using SpaBookingSystem.Services.Email;
 using SpaBookingSystem.ApplicationCore.Entities;
 using SpaBookingSystem.DataLayer;
 using System.Security.Claims;
 using SpaBookingSystem.Api.Helpers;
-using SpaBookingSystem.Api.Services.Email;
 using SpaBookingSystem.ApplicationCore.Constants;
 
 namespace SpaBookingSystem.Api.Controllers;

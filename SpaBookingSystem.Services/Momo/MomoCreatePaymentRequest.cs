@@ -1,6 +1,6 @@
 using System.Text.Json.Serialization;
 
-namespace SpaBookingSystem.Api.Services.Momo;
+namespace SpaBookingSystem.Services.Momo;
 
 public class MomoCreatePaymentRequest
 {

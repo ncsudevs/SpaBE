@@ -1,4 +1,4 @@
-namespace SpaBookingSystem.Api.Options;
+namespace SpaBookingSystem.Services.Options;
 
 public class MomoOptions
 {
@@ -15,7 +15,6 @@ public class MomoOptions
     public string StoreName { get; set; } = "SuSpa Booking";
     public string PartnerName { get; set; } = "SuSpa Booking";
     public string StoreId { get; set; } = "SuSpaStore";
-
     public string PublicBaseUrl { get; set; } = string.Empty;
     public string ReturnPath { get; set; } = "/api/payments/momo/return";
 }

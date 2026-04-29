@@ -1,10 +1,11 @@
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using SpaBookingSystem.Api.Options;
+using SpaBookingSystem.Services.Options;
 
-namespace SpaBookingSystem.Api.Services.Email;
+namespace SpaBookingSystem.Services.Email;
 
 public class SequenzyEmailSender : IEmailSender
 {

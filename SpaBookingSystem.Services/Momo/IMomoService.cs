@@ -1,4 +1,4 @@
-namespace SpaBookingSystem.Api.Services.Momo;
+namespace SpaBookingSystem.Services.Momo;
 
 public interface IMomoService
 {

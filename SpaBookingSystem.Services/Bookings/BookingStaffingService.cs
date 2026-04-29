@@ -1,27 +1,10 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
 using SpaBookingSystem.ApplicationCore.Constants;
 using SpaBookingSystem.ApplicationCore.Entities;
 using SpaBookingSystem.DataLayer;
 
-namespace SpaBookingSystem.Api.Services;
-
-public interface IBookingStaffingService
-{
-    int GetAssignedQuantity(BookingDetail detail);
-    int GetUnassignedQuantity(BookingDetail detail);
-    bool IsFullyStaffed(BookingDetail detail);
-    bool IsFullyStaffed(Booking booking);
-    string? BuildDetailStaffingWarning(BookingDetail detail);
-    string? BuildBookingStaffingWarning(Booking booking);
-    Task<int> GetRemainingCapacityAsync(
-        Staff staff,
-        DateOnly date,
-        string time,
-        int durationMinutes,
-        int? ignoreAssignmentId = null,
-        CancellationToken cancellationToken = default);
-    Task<BookingStaffingResult> AutoAssignAsync(Booking booking, CancellationToken cancellationToken = default);
-}
+namespace SpaBookingSystem.Services.Bookings;
 
 public sealed class BookingStaffingService : IBookingStaffingService
 {
@@ -138,7 +121,6 @@ public sealed class BookingStaffingService : IBookingStaffingService
         if (details.Count == 0)
             return BookingStaffingResult.Empty;
 
-        var appointmentDates = details.Select(x => x.AppointmentDate).Distinct().ToList();
         var categoryIds = details.Select(x => x.Service!.CategoryId).Distinct().ToList();
 
         var eligibleStaff = await _db.Staffs

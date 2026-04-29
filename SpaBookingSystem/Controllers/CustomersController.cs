@@ -8,7 +8,7 @@ using SpaBookingSystem.ApplicationCore.Constants;
 using SpaBookingSystem.DataLayer;
 using SpaBookingSystem.ApplicationCore.Entities;
 using SpaBookingSystem.Api.Helpers;
-using SpaBookingSystem.Api.Services;
+using SpaBookingSystem.Services.Bookings;
 
 namespace SpaBookingSystem.Api.Controllers;
 

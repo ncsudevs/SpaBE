@@ -1,10 +1,11 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Net.Http.Json;
 using Microsoft.Extensions.Options;
-using SpaBookingSystem.Api.Options;
+using SpaBookingSystem.Services.Options;
 
-namespace SpaBookingSystem.Api.Services.Momo;
+namespace SpaBookingSystem.Services.Momo;
 
 public class MomoService : IMomoService
 {

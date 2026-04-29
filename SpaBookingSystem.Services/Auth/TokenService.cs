@@ -1,11 +1,10 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.IdentityModel.Tokens;
-using SpaBookingSystem.Api.Models.Auth;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Text;
 
-namespace SpaBookingSystem.Api.Services;
+namespace SpaBookingSystem.Services.Auth;
 
 public class TokenService : ITokenService
 {
