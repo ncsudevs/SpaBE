@@ -44,7 +44,7 @@ public class BookingStatusService : IBookingStatusService
         };
     }
 
-    public string? ValidateCheckInChange(Booking booking, bool isCheckedIn)
+    public string? ValidateCheckInChange(Booking booking, bool isCheckedIn, bool isFullyStaffed)
     {
         if (booking.PaymentStatus != PaymentStatusNames.Paid)
             return "Only paid bookings can be checked in.";
@@ -56,7 +56,9 @@ public class BookingStatusService : IBookingStatusService
         {
             return booking.Status != BookingStatusNames.Confirmed
                 ? "Only confirmed bookings can be checked in."
-                : null;
+                : !isFullyStaffed
+                    ? "Finish staffing every booking item before checking in the customer."
+                    : null;
         }
 
         return booking.Status == BookingStatusNames.Completed
@@ -70,15 +72,26 @@ public class BookingStatusService : IBookingStatusService
         {
             ResetCheckIn(booking);
         }
+        else if (nextStatus == BookingStatusNames.Completed)
+        {
+            booking.IsCheckedIn = true;
+            booking.CheckedInAt ??= DateTime.UtcNow;
+        }
 
         booking.Status = nextStatus;
         booking.UpdatedAt = DateTime.UtcNow;
     }
 
-    public void SetCheckIn(Booking booking, bool isCheckedIn)
+    public void SetCheckIn(Booking booking, bool isCheckedIn, bool isFullyStaffed)
     {
         booking.IsCheckedIn = isCheckedIn;
         booking.CheckedInAt = isCheckedIn ? DateTime.UtcNow : null;
+
+        if (isCheckedIn && booking.Status == BookingStatusNames.Confirmed && isFullyStaffed)
+        {
+            booking.Status = BookingStatusNames.Completed;
+        }
+
         booking.UpdatedAt = DateTime.UtcNow;
     }
 
@@ -89,9 +102,9 @@ public class BookingStatusService : IBookingStatusService
     }
 
     public bool IsEffectiveCheckedIn(Booking booking) =>
-        booking.IsCheckedIn
-        && booking.Status == BookingStatusNames.Confirmed
-        && booking.PaymentStatus == PaymentStatusNames.Paid;
+        booking.PaymentStatus == PaymentStatusNames.Paid
+        && (booking.Status == BookingStatusNames.Completed
+            || (booking.IsCheckedIn && booking.Status == BookingStatusNames.Confirmed));
 
     public string GetWorkflowStatus(Booking booking)
     {

@@ -324,11 +324,15 @@ public class BookingsController : ControllerBase
         if (booking == null)
             return NotFound(new { message = "Booking not found" });
 
-        var validationMessage = _bookingStatusService.ValidateCheckInChange(booking, dto.IsCheckedIn);
+        var isFullyStaffed = _bookingStaffingService.IsFullyStaffed(booking);
+        var validationMessage = _bookingStatusService.ValidateCheckInChange(
+            booking,
+            dto.IsCheckedIn,
+            isFullyStaffed);
         if (!string.IsNullOrWhiteSpace(validationMessage))
             return Conflict(new { message = validationMessage });
 
-        _bookingStatusService.SetCheckIn(booking, dto.IsCheckedIn);
+        _bookingStatusService.SetCheckIn(booking, dto.IsCheckedIn, isFullyStaffed);
 
         await _db.SaveChangesAsync();
         return Ok(MapBooking(booking));
