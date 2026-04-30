@@ -7,6 +7,8 @@ public class BookingStatusService : IBookingStatusService
 {
     public string? ValidateAdminStatusChange(Booking booking, string nextStatus, bool isFullyStaffed)
     {
+        // A cancelled booking is treated as final state because downstream
+        // payment/refund history should stay auditable once the flow is closed.
         if (booking.Status == BookingStatusNames.Cancelled && nextStatus != BookingStatusNames.Cancelled)
             return "Cancelled bookings are final and cannot be reopened.";
 
@@ -74,6 +76,8 @@ public class BookingStatusService : IBookingStatusService
         }
         else if (nextStatus == BookingStatusNames.Completed)
         {
+            // Completed is only meaningful after a real check-in moment, so we
+            // keep the timestamp even when completion is triggered by admin.
             booking.IsCheckedIn = true;
             booking.CheckedInAt ??= DateTime.UtcNow;
         }
@@ -87,6 +91,8 @@ public class BookingStatusService : IBookingStatusService
         booking.IsCheckedIn = isCheckedIn;
         booking.CheckedInAt = isCheckedIn ? DateTime.UtcNow : null;
 
+        // The UI treats check-in as the final action for a ready booking, so
+        // the backend promotes CONFIRMED -> COMPLETED in the same request.
         if (isCheckedIn && booking.Status == BookingStatusNames.Confirmed && isFullyStaffed)
         {
             booking.Status = BookingStatusNames.Completed;
@@ -102,6 +108,8 @@ public class BookingStatusService : IBookingStatusService
     }
 
     public bool IsEffectiveCheckedIn(Booking booking) =>
+        // Completed bookings should still read as checked-in from the
+        // customer's perspective even though the stored status moved on.
         booking.PaymentStatus == PaymentStatusNames.Paid
         && (booking.Status == BookingStatusNames.Completed
             || (booking.IsCheckedIn && booking.Status == BookingStatusNames.Confirmed));

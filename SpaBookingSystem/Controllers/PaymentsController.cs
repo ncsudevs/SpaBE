@@ -21,6 +21,8 @@ namespace SpaBookingSystem.Api.Controllers;
 [Route("api/payments")]
 public class PaymentsController : ControllerBase
 {
+    // Payment method/status guards stay in the controller because they shape
+    // the HTTP contract and determine which operational actions are legal.
     private static readonly string[] AllowedMethods = [PaymentMethodNames.Momo, PaymentMethodNames.BankTransfer];
     private static readonly string[] AdminAllowedStatuses =
     [
@@ -152,6 +154,8 @@ public class PaymentsController : ControllerBase
             .ThenByDescending(p => p.Id)
             .FirstOrDefault(p => IsActivePaymentStatus(p.Status));
 
+        // Keep one active payment conversation at a time per booking so the
+        // customer cannot create overlapping payment attempts accidentally.
         if (latestActivePayment != null)
         {
             if (latestActivePayment.Method == PaymentMethodNames.Momo && method == PaymentMethodNames.Momo)
@@ -427,6 +431,8 @@ public class PaymentsController : ControllerBase
                         string.Join(" | ", paidResult.Warnings));
                 }
 
+                await NotifyAssignedStaffForBookingAsync(payment.Booking, CancellationToken.None);
+
                 await TrySendEmailAsync(
                     payment.Booking.Email,
                     "SuSpa payment confirmed",
@@ -488,6 +494,18 @@ public class PaymentsController : ControllerBase
         payment.Booking.UpdatedAt = DateTime.UtcNow;
 
         await _db.SaveChangesAsync();
+
+        await TrySendEmailAsync(
+            payment.Booking.Email,
+            "SuSpa payment refunded",
+            EmailTemplateService.BuildPaymentRefundedTemplate(
+                payment.Booking.FullName,
+                payment.Booking.BookingCode,
+                payment.PaymentCode,
+                reason),
+            CancellationToken.None,
+            $"sending refund email for booking {payment.Booking.BookingCode}");
+
         return Ok(MapPayment(payment));
     }
 
@@ -651,6 +669,44 @@ public class PaymentsController : ControllerBase
                 body,
                 cancellationToken,
                 $"notifying cashier {email} about payment {payment.PaymentCode}");
+        }
+    }
+
+    private async Task NotifyAssignedStaffForBookingAsync(Booking booking, CancellationToken cancellationToken)
+    {
+        // Payment confirmation can auto-assign staff, so notifications are sent
+        // after the booking graph is reloaded with the final assignment state.
+        await _db.Entry(booking)
+            .Collection(x => x.BookingDetails)
+            .Query()
+            .Include(x => x.Service)
+            .Include(x => x.StaffAssignments)
+                .ThenInclude(x => x.Staff)
+            .LoadAsync(cancellationToken);
+
+        foreach (var detail in booking.BookingDetails.Where(x => x.Service != null))
+        {
+            foreach (var assignment in detail.StaffAssignments)
+            {
+                if (assignment.Staff == null || string.IsNullOrWhiteSpace(assignment.Staff.Email))
+                    continue;
+
+                await TrySendEmailAsync(
+                    assignment.Staff.Email,
+                    "SuSpa service assignment",
+                    EmailTemplateService.BuildStaffAssignedTemplate(
+                        assignment.Staff.FullName,
+                        booking.BookingCode,
+                        detail.Service!.Name,
+                        $"{detail.AppointmentDate:dd/MM/yyyy}",
+                        detail.AppointmentTime ?? string.Empty,
+                        assignment.AssignedQuantity,
+                        booking.FullName,
+                        booking.Phone,
+                        booking.Email),
+                    cancellationToken,
+                    $"notifying staff {assignment.Staff.Email} about assignment for booking {booking.BookingCode}");
+            }
         }
     }
 
@@ -857,6 +913,8 @@ public class PaymentsController : ControllerBase
         payment.Booking.Status = BookingStatusNames.Confirmed;
         payment.Booking.UpdatedAt = DateTime.UtcNow;
 
+        // Auto-assignment is best-effort: incomplete staffing should not block
+        // a successful payment from being recorded and confirmed.
         var staffingResult = await _bookingStaffingService.AutoAssignAsync(payment.Booking, cancellationToken);
         if (staffingResult.HasIncompleteStaffing)
         {
@@ -865,6 +923,8 @@ public class PaymentsController : ControllerBase
                 payment.Booking.BookingCode,
                 string.Join(" | ", staffingResult.Warnings));
         }
+
+        await NotifyAssignedStaffForBookingAsync(payment.Booking, cancellationToken);
 
         await TrySendEmailAsync(
             payment.Booking.Email,

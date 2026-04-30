@@ -8,6 +8,7 @@ using SpaBookingSystem.DataLayer;
 using System.Security.Claims;
 using SpaBookingSystem.Api.Helpers;
 using SpaBookingSystem.Services.Bookings;
+using SpaBookingSystem.Services.Email;
 
 namespace SpaBookingSystem.Api.Controllers;
 
@@ -26,15 +27,21 @@ public class BookingsController : ControllerBase
     private readonly SpaDbContext _db;
     private readonly IBookingStaffingService _bookingStaffingService;
     private readonly IBookingStatusService _bookingStatusService;
+    private readonly IEmailSender _emailSender;
+    private readonly ILogger<BookingsController> _logger;
 
     public BookingsController(
         SpaDbContext db,
         IBookingStaffingService bookingStaffingService,
-        IBookingStatusService bookingStatusService)
+        IBookingStatusService bookingStatusService,
+        IEmailSender emailSender,
+        ILogger<BookingsController> logger)
     {
         _db = db;
         _bookingStaffingService = bookingStaffingService;
         _bookingStatusService = bookingStatusService;
+        _emailSender = emailSender;
+        _logger = logger;
     }
 
     [Authorize]
@@ -141,6 +148,9 @@ public class BookingsController : ControllerBase
 
         if (!PhoneHelper.TryNormalizePhone(dto.Phone, dto.Region, out var normalizedPhone, out var phoneError))
             return BadRequest(new { message = phoneError });
+
+        // Normalize incoming items once so every downstream validation works on
+        // the same appointment-time representation.
         var normalizedItems = dto.Items.Select(x => new NormalizedBookingItem
         {
             ServiceId = x.ServiceId,
@@ -167,6 +177,8 @@ public class BookingsController : ControllerBase
         if (normalizedItems.Any(x => x.Quantity <= 0 || string.IsNullOrWhiteSpace(x.AppointmentTime)))
             return BadRequest(new { message = "Each booking item must have a valid quantity and preferred time" });
 
+        // Group bookings are intentionally constrained to one service line so
+        // slot capacity and staffing stay predictable for this prototype.
         if (dto.IsGroupBooking)
         {
             if (normalizedItems.Count != 1)
@@ -270,6 +282,8 @@ public class BookingsController : ControllerBase
                 .ThenInclude(x => x.Staff)
             .LoadAsync();
         await _db.Entry(booking).Collection(x => x.Payments).LoadAsync();
+
+        await NotifyCashiersOfNewBookingAsync(booking, HttpContext.RequestAborted);
         return CreatedAtAction(nameof(GetById), new { id = booking.Id }, MapBooking(booking));
     }
 
@@ -301,9 +315,16 @@ public class BookingsController : ControllerBase
         if (!string.IsNullOrWhiteSpace(validationMessage))
             return BadRequest(new { message = validationMessage });
 
+        var previousStatus = booking.Status;
         _bookingStatusService.ApplyAdminStatusChange(booking, status);
 
         await _db.SaveChangesAsync();
+
+        if (previousStatus != booking.Status)
+        {
+            await NotifyCustomerStatusChangeAsync(booking, previousStatus, HttpContext.RequestAborted);
+        }
+
         return Ok(MapBooking(booking));
     }
 
@@ -332,9 +353,16 @@ public class BookingsController : ControllerBase
         if (!string.IsNullOrWhiteSpace(validationMessage))
             return Conflict(new { message = validationMessage });
 
+        var previousStatus = booking.Status;
         _bookingStatusService.SetCheckIn(booking, dto.IsCheckedIn, isFullyStaffed);
 
         await _db.SaveChangesAsync();
+
+        if (previousStatus != booking.Status)
+        {
+            await NotifyCustomerStatusChangeAsync(booking, previousStatus, HttpContext.RequestAborted);
+        }
+
         return Ok(MapBooking(booking));
     }
 
@@ -365,6 +393,8 @@ public class BookingsController : ControllerBase
         detail.Booking.UpdatedAt = DateTime.UtcNow;
         await _db.SaveChangesAsync();
 
+        await NotifyAssignedStaffForDetailAsync(detail, HttpContext.RequestAborted);
+
         return Ok(MapBooking(detail.Booking));
     }
 
@@ -391,10 +421,12 @@ public class BookingsController : ControllerBase
             return validationError;
 
         assignment.StaffId = dto.StaffId;
+        assignment.Staff = null;
         assignment.AssignedQuantity = dto.AssignedQuantity;
         detail.Booking.UpdatedAt = DateTime.UtcNow;
 
         await _db.SaveChangesAsync();
+        await NotifyAssignedStaffForDetailAsync(detail, HttpContext.RequestAborted);
         return Ok(MapBooking(detail.Booking));
     }
 
@@ -564,6 +596,8 @@ public class BookingsController : ControllerBase
         if (detail.Service == null || !staff.StaffCategories.Any(sc => sc.CategoryId == detail.Service.CategoryId))
             return Conflict(new { message = "Staff does not match the service category." });
 
+        // Capacity is evaluated against overlapping time ranges, not just an
+        // equal slot string, so staff cannot be overbooked across long services.
         var remainingCapacity = await _bookingStaffingService.GetRemainingCapacityAsync(
             staff,
             detail.AppointmentDate,
@@ -582,8 +616,148 @@ public class BookingsController : ControllerBase
         return null;
     }
 
+    private async Task NotifyCashiersOfNewBookingAsync(Booking booking, CancellationToken cancellationToken)
+    {
+        var recipients = await _db.Admins
+            .AsNoTracking()
+            .Where(x => x.IsActive
+                && x.Role == RoleNames.Cashier
+                && !string.IsNullOrWhiteSpace(x.Email))
+            .Select(x => x.Email!)
+            .Distinct()
+            .ToListAsync(cancellationToken);
+
+        if (recipients.Count == 0)
+            return;
+
+        var firstSlot = booking.BookingDetails
+            .OrderBy(x => x.AppointmentDate)
+            .ThenBy(x => x.AppointmentTime)
+            .FirstOrDefault();
+
+        var body = EmailTemplateService.BuildCashierNewBookingTemplate(
+            booking.BookingCode,
+            booking.FullName,
+            booking.Phone,
+            booking.Email,
+            $"{(firstSlot?.AppointmentDate ?? booking.AppointmentDate):dd/MM/yyyy}",
+            firstSlot?.AppointmentTime ?? booking.AppointmentTime,
+            booking.TotalAmount,
+            booking.IsGroupBooking,
+            booking.GroupSize);
+
+        foreach (var recipient in recipients)
+        {
+            await TrySendEmailAsync(
+                recipient,
+                "SuSpa new booking created",
+                body,
+                cancellationToken,
+                $"notifying cashier {recipient} about booking {booking.BookingCode}");
+        }
+    }
+
+    private async Task NotifyAssignedStaffForDetailAsync(BookingDetail detail, CancellationToken cancellationToken)
+    {
+        if (detail.Booking == null)
+        {
+            detail = await LoadDetailForAssignmentAsync(detail.Id) ?? detail;
+        }
+
+        if (detail.Booking == null || detail.Service == null)
+            return;
+
+        foreach (var assignment in detail.StaffAssignments)
+        {
+            var staff = assignment.Staff;
+            if (staff == null && assignment.StaffId > 0)
+            {
+                staff = await _db.Staffs
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(x => x.Id == assignment.StaffId, cancellationToken);
+            }
+
+            if (staff == null || string.IsNullOrWhiteSpace(staff.Email))
+                continue;
+
+            await TrySendEmailAsync(
+                staff.Email,
+                "SuSpa service assignment",
+                EmailTemplateService.BuildStaffAssignedTemplate(
+                    staff.FullName,
+                    detail.Booking.BookingCode,
+                    detail.Service.Name,
+                    $"{detail.AppointmentDate:dd/MM/yyyy}",
+                    detail.AppointmentTime ?? string.Empty,
+                    assignment.AssignedQuantity,
+                    detail.Booking.FullName,
+                    detail.Booking.Phone,
+                    detail.Booking.Email),
+                cancellationToken,
+                $"notifying staff {staff.Email} about assignment for booking {detail.Booking.BookingCode}");
+        }
+    }
+
+    private async Task NotifyCustomerStatusChangeAsync(
+        Booking booking,
+        string previousStatus,
+        CancellationToken cancellationToken)
+    {
+        if (previousStatus == booking.Status)
+            return;
+
+        if (booking.Status == BookingStatusNames.Confirmed)
+        {
+            await TrySendEmailAsync(
+                booking.Email,
+                "SuSpa booking confirmed",
+                EmailTemplateService.BuildPaymentConfirmedTemplate(
+                    booking.FullName,
+                    booking.BookingCode,
+                    booking.Payments
+                        .OrderByDescending(x => x.PaidAt)
+                        .ThenByDescending(x => x.Id)
+                        .FirstOrDefault()?.PaymentCode ?? booking.BookingCode),
+                cancellationToken,
+                $"sending booking confirmed email for booking {booking.BookingCode}");
+        }
+        else if (booking.Status == BookingStatusNames.Completed)
+        {
+            await TrySendEmailAsync(
+                booking.Email,
+                "SuSpa booking completed",
+                EmailTemplateService.BuildBookingCompletedTemplate(
+                    booking.FullName,
+                    booking.BookingCode),
+                cancellationToken,
+                $"sending booking completed email for booking {booking.BookingCode}");
+        }
+    }
+
+    private async Task<bool> TrySendEmailAsync(
+        string toEmail,
+        string subject,
+        string htmlBody,
+        CancellationToken cancellationToken,
+        string operation)
+    {
+        try
+        {
+            await _emailSender.SendAsync(toEmail, subject, htmlBody, cancellationToken);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Email send failed while {Operation}", operation);
+            return false;
+        }
+    }
+
     private BookingDto MapBooking(Booking booking)
     {
+        // The API returns both raw states and a derived workflow view so the
+        // frontend can render the current operational stage without re-encoding
+        // the booking rules in JavaScript.
         var effectiveCheckedIn = _bookingStatusService.IsEffectiveCheckedIn(booking);
         var firstSlot = booking.BookingDetails.OrderBy(x => x.AppointmentDate).ThenBy(x => x.AppointmentTime).FirstOrDefault();
         var latestPayment = booking.Payments?

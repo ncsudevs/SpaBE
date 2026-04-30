@@ -2,6 +2,8 @@ namespace SpaBookingSystem.Services.Email;
 
 public static class EmailTemplateService
 {
+    // Keep email bodies centralized here so workflow controllers only decide
+    // when a notification should be sent, not how the HTML is composed.
     public static string BuildRegisterTemplate(string fullName, string code)
     {
         return $@"
@@ -79,6 +81,28 @@ public static class EmailTemplateService
 <p>Your booking status is now <strong>CONFIRMED</strong>.</p>";
     }
 
+    public static string BuildBookingCompletedTemplate(string fullName, string bookingCode)
+    {
+        return $@"
+<h2>Booking completed</h2>
+<p>Hello <strong>{fullName}</strong>,</p>
+<p>Your appointment for booking <strong>{bookingCode}</strong> has been marked as completed.</p>
+<p>Thank you for visiting SuSpa. We hope to welcome you again soon.</p>";
+    }
+
+    public static string BuildPaymentRefundedTemplate(string fullName, string bookingCode, string paymentCode, string refundReason)
+    {
+        return $@"
+<h2>Payment refunded</h2>
+<p>Hello <strong>{fullName}</strong>,</p>
+<p>Your payment for booking <strong>{bookingCode}</strong> has been refunded.</p>
+<ul>
+  <li>Payment code: <strong>{paymentCode}</strong></li>
+  <li>Refund reason: <strong>{refundReason}</strong></li>
+</ul>
+<p>Your booking is now closed. If you need a new appointment, please create a new booking from the website.</p>";
+    }
+
     public static string BuildPaymentRejectedTemplate(string fullName, string bookingCode, string paymentCode)
     {
         return $@"
@@ -87,5 +111,63 @@ public static class EmailTemplateService
 <p>Your payment for booking <strong>{bookingCode}</strong> could not be confirmed.</p>
 <p>Payment code: <strong>{paymentCode}</strong></p>
 <p>Please review your transfer and submit payment again.</p>";
+    }
+
+    public static string BuildCashierNewBookingTemplate(
+        string bookingCode,
+        string customerName,
+        string customerPhone,
+        string customerEmail,
+        string appointmentDate,
+        string appointmentTime,
+        decimal totalAmount,
+        bool isGroupBooking,
+        int groupSize)
+    {
+        var bookingScope = isGroupBooking
+            ? $"Group booking for <strong>{groupSize}</strong> people"
+            : "Personal booking";
+
+        return $@"
+<h2>New booking created</h2>
+<p>A new booking has just been created and is ready for operational follow-up.</p>
+<ul>
+  <li>Booking code: <strong>{bookingCode}</strong></li>
+  <li>Customer: <strong>{customerName}</strong></li>
+  <li>Phone: <strong>{customerPhone}</strong></li>
+  <li>Email: <strong>{customerEmail}</strong></li>
+  <li>Appointment date: <strong>{appointmentDate}</strong></li>
+  <li>Appointment time: <strong>{appointmentTime}</strong></li>
+  <li>Total amount: <strong>{totalAmount:N0}</strong></li>
+  <li>Booking type: <strong>{bookingScope}</strong></li>
+</ul>
+<p>Please monitor payment progress and prepare the booking workflow when needed.</p>";
+    }
+
+    public static string BuildStaffAssignedTemplate(
+        string staffName,
+        string bookingCode,
+        string serviceName,
+        string appointmentDate,
+        string appointmentTime,
+        int assignedQuantity,
+        string customerName,
+        string customerPhone,
+        string customerEmail)
+    {
+        return $@"
+<h2>New service assignment</h2>
+<p>Hello <strong>{staffName}</strong>,</p>
+<p>You have been assigned to booking <strong>{bookingCode}</strong>.</p>
+<ul>
+  <li>Service: <strong>{serviceName}</strong></li>
+  <li>Appointment date: <strong>{appointmentDate}</strong></li>
+  <li>Appointment time: <strong>{appointmentTime}</strong></li>
+  <li>Assigned quantity: <strong>{assignedQuantity}</strong></li>
+  <li>Customer: <strong>{customerName}</strong></li>
+  <li>Phone: <strong>{customerPhone}</strong></li>
+  <li>Email: <strong>{customerEmail}</strong></li>
+</ul>
+<p>Please review your schedule and prepare for the appointment.</p>";
     }
 }
