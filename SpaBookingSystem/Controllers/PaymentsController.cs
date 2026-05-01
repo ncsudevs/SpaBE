@@ -431,7 +431,11 @@ public class PaymentsController : ControllerBase
                         string.Join(" | ", paidResult.Warnings));
                 }
 
-                await NotifyAssignedStaffForBookingAsync(payment.Booking, CancellationToken.None);
+                // Persist auto-created assignments before reloading the booking
+                // graph for notification delivery.
+                await _db.SaveChangesAsync();
+
+                await NotifyAssignedStaffForBookingAsync(payment.Booking, HttpContext.RequestAborted);
 
                 await TrySendEmailAsync(
                     payment.Booking.Email,
@@ -688,14 +692,22 @@ public class PaymentsController : ControllerBase
         {
             foreach (var assignment in detail.StaffAssignments)
             {
-                if (assignment.Staff == null || string.IsNullOrWhiteSpace(assignment.Staff.Email))
+                var staff = assignment.Staff;
+                if (staff == null && assignment.StaffId > 0)
+                {
+                    staff = await _db.Staffs
+                        .AsNoTracking()
+                        .FirstOrDefaultAsync(x => x.Id == assignment.StaffId, cancellationToken);
+                }
+
+                if (staff == null || string.IsNullOrWhiteSpace(staff.Email))
                     continue;
 
                 await TrySendEmailAsync(
-                    assignment.Staff.Email,
+                    staff.Email,
                     "SuSpa service assignment",
                     EmailTemplateService.BuildStaffAssignedTemplate(
-                        assignment.Staff.FullName,
+                        staff.FullName,
                         booking.BookingCode,
                         detail.Service!.Name,
                         $"{detail.AppointmentDate:dd/MM/yyyy}",
@@ -705,7 +717,7 @@ public class PaymentsController : ControllerBase
                         booking.Phone,
                         booking.Email),
                     cancellationToken,
-                    $"notifying staff {assignment.Staff.Email} about assignment for booking {booking.BookingCode}");
+                    $"notifying staff {staff.Email} about assignment for booking {booking.BookingCode}");
             }
         }
     }
