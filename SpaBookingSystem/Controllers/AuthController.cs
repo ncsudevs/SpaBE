@@ -99,6 +99,8 @@ public class AuthController : ControllerBase
     {
         var normalizedEmail = dto.Email.Trim().ToLower();
 
+        // Admin/cashier accounts live in a separate table, so that branch must
+        // be checked first before falling back to customer authentication.
         var admin = await _db.Admins.FirstOrDefaultAsync(x => x.Email.ToLower() == normalizedEmail);
         if (admin != null)
         {
@@ -172,6 +174,8 @@ public class AuthController : ControllerBase
         if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(role))
             return Unauthorized(new { message = "Invalid token" });
 
+        // The token only carries lightweight claims, so /me reloads the full
+        // profile from the correct table to keep UI state fresh after edits.
         if (role == RoleNames.Admin || role == RoleNames.Cashier)
         {
             var admin = await _db.Admins.AsNoTracking().FirstOrDefaultAsync(x => x.Email.ToLower() == email);

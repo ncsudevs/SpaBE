@@ -25,6 +25,8 @@ public class TokenService : ITokenService
             ? parsedMinutes
             : 120;
 
+        // Keep the token payload small: only the claims needed by route guards
+        // and ownership checks are included here.
         var claims = new List<Claim>
         {
             new(ClaimTypes.NameIdentifier, user.Id.ToString()),
@@ -38,6 +40,8 @@ public class TokenService : ITokenService
             new SymmetricSecurityKey(Encoding.UTF8.GetBytes(key)),
             SecurityAlgorithms.HmacSha256);
 
+        // The API trusts this signed token on later requests instead of asking
+        // the user to log in again for every call.
         var token = new JwtSecurityToken(
             issuer: issuer,
             audience: audience,

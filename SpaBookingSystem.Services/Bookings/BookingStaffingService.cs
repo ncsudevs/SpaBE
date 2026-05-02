@@ -161,6 +161,8 @@ public sealed class BookingStaffingService : IBookingStaffingService
 
                 foreach (var staff in candidates)
                 {
+                    // Combine persisted assignments with in-memory planned loads
+                    // so one auto-assign pass cannot overbook the same staff.
                     var persistedRemaining = await GetRemainingCapacityAsync(
                         staff,
                         detail.AppointmentDate,
@@ -194,6 +196,8 @@ public sealed class BookingStaffingService : IBookingStaffingService
 
                 if (existingAssignment == null)
                 {
+                    // Reuse the booking detail collection so the caller sees
+                    // the new assignments immediately on the same entity graph.
                     existingAssignment = new BookingDetailStaffAssignment
                     {
                         StaffId = nextCandidate.Staff.Id,
