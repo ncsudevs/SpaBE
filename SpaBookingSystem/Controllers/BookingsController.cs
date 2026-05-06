@@ -421,7 +421,6 @@ public class BookingsController : ControllerBase
             return validationError;
 
         assignment.StaffId = dto.StaffId;
-        assignment.Staff = null;
         assignment.AssignedQuantity = dto.AssignedQuantity;
         detail.Booking.UpdatedAt = DateTime.UtcNow;
 

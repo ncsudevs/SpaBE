@@ -4,19 +4,35 @@ public static class EmailTemplateService
 {
     // Keep email bodies centralized here so workflow controllers only decide
     // when a notification should be sent, not how the HTML is composed.
-    public static string BuildRegisterTemplate(string fullName, string code)
+    private static string WrapHtml(string bodyContent)
     {
         return $@"
+<!DOCTYPE html>
+<html lang=""en"">
+<head>
+  <meta charset=""utf-8"" />
+  <meta name=""viewport"" content=""width=device-width, initial-scale=1.0"" />
+  <title>SuSpa Notification</title>
+</head>
+<body style=""font-family: Georgia, 'Times New Roman', serif; color: #1f1f1f; line-height: 1.6;"">
+{bodyContent}
+</body>
+</html>";
+    }
+
+    public static string BuildRegisterTemplate(string fullName, string code)
+    {
+        return WrapHtml($@"
 <h2>Welcome to SuSpa</h2>
 <p>Hello <strong>{fullName}</strong>,</p>
 <p>Your account has been created successfully.</p>
 <p>Your registration code is: <strong>{code}</strong></p>
-<p>Please keep this code for support or future verification.</p>";
+<p>Please keep this code for support or future verification.</p>");
     }
 
     public static string BuildPaymentRequestTemplate(string fullName, string bookingCode, string paymentCode, string method, decimal amount, string content)
     {
-        return $@"
+        return WrapHtml($@"
 <h2>Payment request received</h2>
 <p>Hello <strong>{fullName}</strong>,</p>
 <p>We have received your payment request for booking <strong>{bookingCode}</strong>.</p>
@@ -26,12 +42,12 @@ public static class EmailTemplateService
   <li>Amount: <strong>{amount:N0}</strong></li>
   <li>Transfer content: <strong>{content}</strong></li>
 </ul>
-<p>Your order is waiting for admin confirmation.</p>";
+<p>Your order is waiting for admin confirmation.</p>");
     }
 
     public static string BuildBankTransferInstructionTemplate(string fullName, string bookingCode, string paymentCode, string providerName, string accountNumber, string accountName, decimal amount, string content, string instruction)
     {
-        return $@"
+        return WrapHtml($@"
 <h2>Bank transfer instruction</h2>
 <p>Hello <strong>{fullName}</strong>,</p>
 <p>Your payment request for booking <strong>{bookingCode}</strong> has been created.</p>
@@ -43,12 +59,12 @@ public static class EmailTemplateService
   <li>Amount: <strong>{amount:N0}</strong></li>
   <li>Transfer content: <strong>{content}</strong></li>
 </ul>
-<p>{instruction}</p>";
+<p>{instruction}</p>");
     }
 
     public static string BuildCashierPaymentSubmittedTemplate(string bookingCode, string paymentCode, string customerName, decimal amount, string content)
     {
-        return $@"
+        return WrapHtml($@"
 <h2>Customer submitted bank transfer</h2>
 <p>A customer has confirmed a bank transfer and is waiting for cashier review.</p>
 <ul>
@@ -58,41 +74,41 @@ public static class EmailTemplateService
   <li>Amount: <strong>{amount:N0}</strong></li>
   <li>Transfer content: <strong>{content}</strong></li>
 </ul>
-<p>Please review the incoming transfer and update the payment status.</p>";
+<p>Please review the incoming transfer and update the payment status.</p>");
     }
 
     public static string BuildBankTransferSubmittedTemplate(string fullName, string bookingCode, string paymentCode)
     {
-        return $@"
+        return WrapHtml($@"
 <h2>Transfer confirmation received</h2>
 <p>Hello <strong>{fullName}</strong>,</p>
 <p>We have received your transfer confirmation for booking <strong>{bookingCode}</strong>.</p>
 <p>Payment code: <strong>{paymentCode}</strong></p>
-<p>The cashier will review the transfer and update your booking once it is verified.</p>";
+<p>The cashier will review the transfer and update your booking once it is verified.</p>");
     }
 
     public static string BuildPaymentConfirmedTemplate(string fullName, string bookingCode, string paymentCode)
     {
-        return $@"
+        return WrapHtml($@"
 <h2>Payment confirmed</h2>
 <p>Hello <strong>{fullName}</strong>,</p>
 <p>Your payment for booking <strong>{bookingCode}</strong> has been confirmed.</p>
 <p>Payment code: <strong>{paymentCode}</strong></p>
-<p>Your booking status is now <strong>CONFIRMED</strong>.</p>";
+<p>Your booking status is now <strong>CONFIRMED</strong>.</p>");
     }
 
     public static string BuildBookingCompletedTemplate(string fullName, string bookingCode)
     {
-        return $@"
+        return WrapHtml($@"
 <h2>Booking completed</h2>
 <p>Hello <strong>{fullName}</strong>,</p>
 <p>Your appointment for booking <strong>{bookingCode}</strong> has been marked as completed.</p>
-<p>Thank you for visiting SuSpa. We hope to welcome you again soon.</p>";
+<p>Thank you for visiting SuSpa. We hope to welcome you again soon.</p>");
     }
 
     public static string BuildPaymentRefundedTemplate(string fullName, string bookingCode, string paymentCode, string refundReason)
     {
-        return $@"
+        return WrapHtml($@"
 <h2>Payment refunded</h2>
 <p>Hello <strong>{fullName}</strong>,</p>
 <p>Your payment for booking <strong>{bookingCode}</strong> has been refunded.</p>
@@ -100,17 +116,17 @@ public static class EmailTemplateService
   <li>Payment code: <strong>{paymentCode}</strong></li>
   <li>Refund reason: <strong>{refundReason}</strong></li>
 </ul>
-<p>Your booking is now closed. If you need a new appointment, please create a new booking from the website.</p>";
+<p>Your booking is now closed. If you need a new appointment, please create a new booking from the website.</p>");
     }
 
     public static string BuildPaymentRejectedTemplate(string fullName, string bookingCode, string paymentCode)
     {
-        return $@"
+        return WrapHtml($@"
 <h2>Payment rejected</h2>
 <p>Hello <strong>{fullName}</strong>,</p>
 <p>Your payment for booking <strong>{bookingCode}</strong> could not be confirmed.</p>
 <p>Payment code: <strong>{paymentCode}</strong></p>
-<p>Please review your transfer and submit payment again.</p>";
+<p>Please review your transfer and submit payment again.</p>");
     }
 
     public static string BuildCashierNewBookingTemplate(
@@ -128,7 +144,7 @@ public static class EmailTemplateService
             ? $"Group booking for <strong>{groupSize}</strong> people"
             : "Personal booking";
 
-        return $@"
+        return WrapHtml($@"
 <h2>New booking created</h2>
 <p>A new booking has just been created and is ready for operational follow-up.</p>
 <ul>
@@ -141,7 +157,7 @@ public static class EmailTemplateService
   <li>Total amount: <strong>{totalAmount:N0}</strong></li>
   <li>Booking type: <strong>{bookingScope}</strong></li>
 </ul>
-<p>Please monitor payment progress and prepare the booking workflow when needed.</p>";
+<p>Please monitor payment progress and prepare the booking workflow when needed.</p>");
     }
 
     public static string BuildStaffAssignedTemplate(
@@ -155,7 +171,7 @@ public static class EmailTemplateService
         string customerPhone,
         string customerEmail)
     {
-        return $@"
+        return WrapHtml($@"
 <h2>New service assignment</h2>
 <p>Hello <strong>{staffName}</strong>,</p>
 <p>You have been assigned to booking <strong>{bookingCode}</strong>.</p>
@@ -168,6 +184,6 @@ public static class EmailTemplateService
   <li>Phone: <strong>{customerPhone}</strong></li>
   <li>Email: <strong>{customerEmail}</strong></li>
 </ul>
-<p>Please review your schedule and prepare for the appointment.</p>";
+<p>Please review your schedule and prepare for the appointment.</p>");
     }
 }
