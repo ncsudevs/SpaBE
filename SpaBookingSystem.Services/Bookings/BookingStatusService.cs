@@ -48,6 +48,7 @@ public class BookingStatusService : IBookingStatusService
 
     public string? ValidateCheckInChange(Booking booking, bool isCheckedIn, bool isFullyStaffed)
     {
+       
         if (booking.PaymentStatus != PaymentStatusNames.Paid)
             return "Only paid bookings can be checked in.";
 
@@ -56,6 +57,12 @@ public class BookingStatusService : IBookingStatusService
 
         if (isCheckedIn)
         {
+            var today = DateOnly.FromDateTime(DateTime.Now);
+            if (booking.AppointmentDate > today)
+            {
+                return "Check-in is only allowed on the appointment date.";
+            }
+
             return booking.Status != BookingStatusNames.Confirmed
                 ? "Only confirmed bookings can be checked in."
                 : !isFullyStaffed
