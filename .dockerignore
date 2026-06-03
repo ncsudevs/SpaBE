@@ -1,0 +1,16 @@
+# Ignore build output and IDE/system files to speed up Docker builds
+**/bin/
+**/obj/
+**/.vs/
+**/.git/
+**/.github/
+**/.idea/
+**/.vscode/
+
+# Ignore local configuration files and user-specific settings
+*.user
+*.db
+*.local
+appsettings.Development.json
+Dockerfile
+.dockerignore
